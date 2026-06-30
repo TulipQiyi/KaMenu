@@ -54,6 +54,9 @@ Bottom:
 | `set-meta`    | 设置玩家元数据（旧格式，推荐使用 `meta`）        | ✅ |
 | `js`          | 执行 JavaScript 代码（支持预定义函数）       | ❌ |
 | `actions`     | 执行 Events.Click 下定义的动作列表        | ❌ |
+| `run-task`    | 启动 Events.Tasks 下定义的周期任务        | ❌ |
+| `stop-task`   | 停止指定周期任务                         | ❌ |
+| `stop-current-task` | 停止当前周期任务并中断本轮后续动作          | ❌ |
 | `wait`        | 插入延迟执行                          | ❌ |
 | `return`      | 中断动作执行列表                        | ❌ |
 
@@ -1193,13 +1196,19 @@ JavaScript 功能非常强大，支持访问 Bukkit API、数学计算、条件�
 
 执行 `Events.Click` 下定义的动作列表。这允许你在动作中复用已定义的动作列表，避免重复代码。
 
-**格式：** `actions: <动作列表名称>`
+**格式：**
+
+```yaml
+- 'actions: <动作列表名称>'
+- 'actions: <动作列表名称>,<参数0>,<参数1>'
+```
 
 **参数说明：**
 
 | 参数 | 说明 | 示例 |
 |------|------|------|
 | 动作列表名称 | `Events.Click` 下的动作列表键名 | `greet`, `vip_check`, `daily_reward` |
+| 参数 | 传入动作列表的临时参数，在动作列表内可用 `{arg:0}`、`{arg:1}` 或 `$(arg:0)` 读取 | `玩家`, `生存服务器` |
 
 **示例：**
 
@@ -1207,7 +1216,7 @@ JavaScript 功能非常强大，支持访问 Bukkit API、数学计算、条件�
 Events:
   Click:
     greet:
-      - 'tell: &a你好！欢迎来到服务器。'
+      - 'tell: &a你好，{arg:0}！欢迎来到 &e{arg:1}&a。'
       - 'sound: ENTITY_PLAYER_LEVELUP'
 
     vip_check:
@@ -1224,7 +1233,7 @@ Bottom:
     btn_greet:
       text: '问候'
       actions:
-        - 'actions: greet'  # 执行 Events.Click.greet
+        - 'actions: greet,玩家,生存服务器'  # 执行 Events.Click.greet 并传入参数
 
     btn_vip:
       text: 'VIP 检查'
@@ -1260,6 +1269,24 @@ Bottom:
 3. **变量支持**：动作列表中支持所有 KaMenu 变量（`{data:xxx}`, `{gdata:xxx}` 等）
 4. **复用代码**：避免在多个按钮中重复定义相同的动作序列
 
+**可点击文本传参：**
+
+`Body.message` 和 `hovertext:` 动作中的 `<text>` 标签也支持调用动作列表并传参：
+
+```yaml
+Body:
+  hello_text:
+    type: message
+    text: '&7问候玩家：<text="&a[点击问候]";hover="&7点击执行动作包";actions=hello,玩家,生存服务器>'
+
+Events:
+  Click:
+    hello:
+      - 'tell: &a你好，{arg:0}！欢迎来到 &e{arg:1}&a。'
+```
+
+上例中，`{arg:0}` 的值为 `玩家`，`{arg:1}` 的值为 `生存服务器`。参数使用英文逗号分隔；参数中需要包含逗号时，可以使用单引号、双引号或反引号包裹。
+
 **错误处理：**
 
 如果引用的动作列表不存在，玩家会收到错误消息：
@@ -1272,7 +1299,7 @@ Bottom:
 | 方式 | 使用位置 | 触发方式 | 示例 |
 |------|---------|---------|------|
 | `actions` 动作 | 按钮动作、命令 | 点击按钮/执行命令 | `actions: greet` |
-| `<text>` 标签的 `actions` 参数 | 文本组件（Body.message） | 点击文本 | `<text='点击';actions=greet>` |
+| `<text>` 标签的 `actions` 参数 | 文本组件（Body.message） | 点击文本 | `<text='点击';actions=greet,玩家,生存服务器>` |
 
 **使用场景：**
 
@@ -1286,6 +1313,69 @@ Bottom:
 1. 动作列表必须在 `Events.Click` 下定义
 2. 避免循环引用（如动作列表 A 引用自己）
 3. `actions` 动作本身也可以在条件判断中使用
+
+---
+
+### run-task / stop-task - 控制周期任务
+
+控制 `Events.Tasks` 下定义的周期任务。
+
+**格式：**
+
+```yaml
+- 'run-task: <任务ID>'
+- 'run-task: <任务ID> <次数>'
+- 'run-task: *'
+- 'run-task: * <次数>'
+- 'stop-task: <任务ID>'
+- 'stop-task: *'
+- 'stop-current-task'
+```
+
+**说明：**
+
+| 动作 | 说明 |
+|------|------|
+| `run-task: test` | 启动 `Events.Tasks.test` 任务 |
+| `run-task: test 10` | 启动 `test` 任务并让本次运行最多执行 10 轮 |
+| `run-task: *` | 启动当前菜单内所有未运行任务 |
+| `run-task: * 10` | 启动当前菜单内所有任务，并让本次运行最多执行 10 轮 |
+| `stop-task: test` | 停止正在运行的 `test` 任务，并执行该任务的 `on_end` / `end_actions` |
+| `stop-task: *` | 停止当前菜单内所有正在运行的周期任务 |
+| `stop-current-task` | 仅在周期任务自身动作中有效，停止当前任务循环，并立即中断本轮后续动作 |
+
+如果指定任务已经在运行，`run-task` 不会重复创建同名任务。
+
+**示例：**
+
+```yaml
+Events:
+  Tasks:
+    countdown:
+      mode: manual
+      interval: 20
+      run_immediately: true
+      actions:
+        - 'tell: &e倒计时运行中'
+      on_end:
+        - 'tell: &a倒计时结束'
+
+Bottom:
+  type: multi
+  buttons:
+    start:
+      text: '&a[ 开始 ]'
+      actions:
+        - 'run-task: countdown 10'
+    stop:
+      text: '&c[ 停止 ]'
+      actions:
+        - 'stop-task: countdown'
+    stop_all:
+      text: '&4[ 停止全部 ]'
+      actions:
+        - 'stop-task: *'
+```
 
 ---
 ## 完整示例
