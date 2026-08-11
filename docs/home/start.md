@@ -1,38 +1,38 @@
-# 🚀 快速开始
+# 快速开始
 
 本指南将帮助你快速安装和配置 KaMenu 插件。
 
 ---
 
-## 🎮 系统要求
+## 系统要求
 
 | 项目 | 支持详情                       |
 |------|----------------------------|
-| Minecraft 版本 | 1.21.7+                    |
-| Java 版本 | Java 21+                   |
-| 服务器类型 | **Paper** 及其衍生核心（Purpur 等） |
+| Minecraft 版本 | 1.16.5+                    |
+| Java 版本 | Java 16+                   |
+| 服务器类型 | **Paper**、**Folia**、**Spigot**及兼容衍生核心 |
 | 数据库 | SQLite（默认）、MySQL 5.7+      |
 
 {% hint style="info" %}
 **版本功能支持**： 
 
-- ✅ Paper 1.21.7+：基础功能完整支持
-- ✨ Paper 1.21.8+：推荐版本，API 更加稳定
-- 🎨 Paper 1.21.9+：完整功能（支持 sprite 物品图标、player head 头像等高级特性）
+- ✅ Java 16+：插件公共运行时可在 Java 16 及以上版本加载
+- ✅ 兼容 Bukkit/Spigot/Paper 的 1.16.5+ 核心：容器类菜单、actions、变量、JavaScript、存储和自定义指令等公共功能
+- ✅ Paper/Folia 1.21.7+：启用原生 Dialog
+- Paper 1.21.8+：推荐版本，API 更加稳定
+- Minecraft 1.21.9+：支持 sprite 等新版客户端文本组件；Paper、Folia 与 Spigot 使用相同菜单语法
+- Folia 1.21.7+：支持区域线程调度；建议使用与目标 Minecraft 版本匹配的最新构建
+- Spigot 1.21.6+：支持原生 Dialog、服务端 actions、Events、Inputs、Tasks、JavaScript、存储与外部 API
+- 低于原生 Dialog 最低版本的核心：自动禁用 Dialog 菜单和 ESC Dialog 入口，公共功能仍可使用
 {% endhint %}
 
-{% hint style="warning" %}
-KaMenu 依赖 Paper Dialog API，**不支持**： 
-
-- Paper 1.21.6 及以下版本（API 尚未完全实现）
-- Spigot、CraftBukkit 等非 Paper 服务端
-
-请确保服务器版本为 **Paper 1.21.7 或更高版本**！
+{% hint style="info" %}
+**Folia 兼容说明**：KaMenu 会自动识别 Folia，并将玩家菜单、`wait`、`Events.Tasks`、JavaScript `delay()`、菜单 API 等任务调度到正确的玩家或全局线程。自定义 JavaScript、外部 action handler、PlaceholderAPI 扩展及由 `console:` 调用的其他插件指令，仍取决于对应代码或插件自身是否兼容 Folia。
 {% endhint %}
 
 ---
 
-## 📥 安装步骤
+## 安装步骤
 
 ### 1. 下载插件
 
@@ -54,6 +54,13 @@ KaMenu 的所有功能均可独立运行，无强制依赖。以下为可选依�
 **可选依赖：**
 - [PlaceholderAPI](https://www.spigotmc.org/resources/placeholderapi.6245/) — 在菜单中使用 `%变量%` 格式的 PAPI 占位符
 - [Vault](https://www.spigotmc.org/resources/vault.34315/) — 经济系统集成（如需在动作中操作玩家余额）
+- ItemsAdder — 在 Dialog 中解析 `:字形ID:`、`:offset_像素:`，并使用 ItemsAdder 自定义物品
+- Oraxen — 在 Dialog 中解析 `<glyph:字形ID>`、`<shift:像素>`，并使用 Oraxen 自定义物品
+- CraftEngine — 使用 CraftEngine Dialog 数据包拦截显示 `<image:命名空间:ID>`、`<shift:像素>`，并使用 CraftEngine 自定义物品
+
+{% hint style="info" %}
+ItemsAdder、Oraxen 和 CraftEngine 均为软依赖，未安装时不会影响 KaMenu 启动。使用 CraftEngine 字形时需保持其 `network.intercept-packets.dialog: true`；安装或移除这些插件后应完整重启服务器，以确保软依赖加载顺序正确。
+{% endhint %}
 
 ### 3. 安装插件
 
@@ -61,35 +68,80 @@ KaMenu 的所有功能均可独立运行，无强制依赖。以下为可选依�
 2. 启动服务器
 3. 插件会自动：
    - 创建 `plugins/KaMenu/` 配置目录
-   - 释放默认配置文件 `config.yml` 和示例菜单
+   - 释放默认配置文件 `config.yml`
    - 初始化数据库（默认为 SQLite）
 
 {% hint style="info" %}
-首次启动后，`plugins/KaMenu/menus/` 目录会自动生成示例菜单文件，你可以直接参考或修改它们。
+KaMenu 只将 Libby 随插件 JAR 提供，并在插件 `onLoad` 阶段优先热加载 Kotlin，随后加载 Adventure/MiniMessage、数据库驱动和 JavaScript 引擎等运行库。首次启动需要连接 Maven 仓库；依赖缓存完成后，后续启动无需重复下载。
+{% endhint %}
+
+{% hint style="info" %}
+首次使用建议在游戏内执行 `/kamenu guide`（或 `/km guide`）打开入门向导。支持 Dialog 的核心会打开 Dialog 向导；不支持 Dialog 的低版本核心会自动回退到箱子向导。向导直接从插件 jar 内部加载到内存，不会写入 `menus` 目录。
+{% endhint %}
+
+### 4. 打开入门向导
+
+服务器启动后，拥有 `kamenu.admin` 权限的玩家可以执行：
+
+```bash
+/kamenu guide
+```
+
+入门向导会引导你设置插件语言，并按语言释放示例菜单。不支持 Dialog 的低版本核心只释放箱子、熔炉和铁砧等容器类菜单示例；支持 Dialog 的核心会同时释放容器类菜单与 Dialog 示例。示例菜单会写入：
+
+```text
+plugins/KaMenu/menus/example/
+```
+
+你也可以直接使用指令释放示例菜单：
+
+```bash
+# 按当前插件语言释放示例
+/kamenu examples
+
+# 释放中文示例
+/kamenu examples zh_CN
+
+# 释放英文示例
+/kamenu examples en_US
+```
+
+{% hint style="info" %}
+当服务器当前没有加载任何菜单，且 OP 玩家进入服务器时，KaMenu 会发送一条可点击的入门向导提示，方便首次配置。
 {% endhint %}
 
 ---
 
-## 🧪 验证安装
+## 验证安装
 
 服务器启动后，控制台应显示 KaMenu 的启动 Logo，包含版本、数据库类型、已加载菜单数量等信息。
 
 你也可以在游戏中执行以下指令验证安装是否成功：
 
 ```
-/km open example/actions_demo
+/kamenu guide
 ```
 
-如果成功弹出一个演示菜单，则表示安装正常。
+如果成功弹出入门向导，则表示安装正常。释放示例菜单后，低版本核心可执行 `/km open example/container_main` 打开箱子示例；支持 Dialog 的核心也可执行 `/km open example/actions_demo` 打开 Dialog 动作示例。
 
 ---
 
-## 🔄 热重载
+## 热重载
 
-修改配置文件或菜单文件后，无需重启服务器，执行以下指令即可重新加载：
+修改配置文件或菜单文件后，无需重启服务器即可重新加载。未指定目标时会重载全部模块：
 
 ```
 /km reload
+```
+
+常用的定向重载：
+
+```bash
+/km reload menu      # 仅重载菜单
+/km reload config    # 重载 config.yml、custom_commands.yml、语言文件和自定义指令
+/km reload actions   # 仅重载全局动作包
+/km reload js        # 仅重载全局 JavaScript 包
+/km reload lang      # 仅重载当前语言文件
 ```
 
 需要 `kamenu.admin` 权限。

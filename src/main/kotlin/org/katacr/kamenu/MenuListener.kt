@@ -13,6 +13,12 @@ import org.bukkit.event.player.PlayerQuitEvent
 import org.bukkit.event.player.PlayerSwapHandItemsEvent
 import org.bukkit.inventory.EquipmentSlot
 
+/**
+ * Bukkit 事件监听器。
+ *
+ * 根据 config.yml 和 item_bindings.yml，把交换副手、右键绑定物品、右键玩家等入口映射为打开菜单。
+ * 同时负责玩家进服向导提示、更新提示，以及退出时清理菜单周期任务和临时元数据。
+ */
 class MenuListener(private val plugin: KaMenu) : Listener {
 
     @EventHandler
@@ -45,46 +51,9 @@ class MenuListener(private val plugin: KaMenu) : Listener {
 
         val player = event.player
         val item = event.item ?: return
-
-        // 检查物品是否有 lore
-        if (!item.hasItemMeta() || !item.itemMeta.hasLore()) return
-
-        val lore = item.itemMeta.lore ?: return
-        val itemMaterial = item.type.name
-
-        val config = plugin.config
-
-        // 遍历 listeners.item-lore 下的所有配置项
-        val itemLoreSection = config.getConfigurationSection("listeners.item-lore") ?: return
-
-        for (key in itemLoreSection.getKeys(false)) {
-            // 检查此配置是否启用
-            if (!config.getBoolean("listeners.item-lore.$key.enabled", false)) continue
-
-            // 获取配置参数
-            val targetMaterial = config.getString("listeners.item-lore.$key.material") ?: continue
-            val targetLore = config.getString("listeners.item-lore.$key.target-lore") ?: continue
-            val menuName = config.getString("listeners.item-lore.$key.menu") ?: continue
-            val requireSneaking = config.getBoolean("listeners.item-lore.$key.require-sneaking", false)
-
-            // 判断潜行条件
-            if (requireSneaking && !player.isSneaking) continue
-
-            // 检查 material 是否匹配（使用规范化的材质匹配）
-            if (!isMaterialMatch(itemMaterial, targetMaterial)) continue
-
-            // 检查物品 lore 是否包含目标文本
-            val hasTargetLore = lore.any { loreLine ->
-                loreLine.contains(targetLore)
-            }
-
-            if (hasTargetLore) {
-                // 取消事件，打开菜单
-                event.isCancelled = true
-                MenuUI.openMenu(player, menuName, plugin.menuManager, plugin)
-                return // 找到匹配后立即返回
-            }
-        }
+        val menuName = plugin.itemBindingManager.findMenu(player, item) ?: return
+        event.isCancelled = true
+        MenuUI.openMenu(player, menuName, plugin.menuManager, plugin)
     }
 
     @EventHandler
@@ -107,7 +76,7 @@ class MenuListener(private val plugin: KaMenu) : Listener {
         // 判断潜行条件（普通右键不潜行，Shift右键需要潜行）
         if (requireSneaking && !player.isSneaking) return
 
-        // 设置meta数据：player为被点击的玩家
+        // 设置 meta 数据：player 为被点击的玩家，供菜单内 {meta:player} 或后续动作读取。
         plugin.metaDataManager.setPlayerMeta(player.uniqueId, "player", targetPlayer.name)
 
         // 取消事件，打开菜单
@@ -117,30 +86,33 @@ class MenuListener(private val plugin: KaMenu) : Listener {
 
     @EventHandler
     fun onPlayerJoin(event: PlayerJoinEvent) {
+        val player = event.player
+        if (player.isOp && plugin.menuManager.getAllMenuIds().isEmpty()) {
+            KaScheduler.runPlayerLater(player, 80L, Runnable {
+                if (!player.isOnline || !player.isOp || plugin.menuManager.getAllMenuIds().isNotEmpty()) {
+                    return@Runnable
+                }
+                val message = plugin.languageManager.getMessage("command.guide_join_hint")
+                MenuUI.sendMessage(player, MenuActions.parseClickableText(message))
+            })
+        }
+
         if (plugin.config.getBoolean("check-update", true)) {
-            val player = event.player
-            Bukkit.getScheduler().runTaskLater(plugin, Runnable {
+            KaScheduler.runPlayerLater(player, 100L, Runnable {
                 UpdateChecker.notifyIfUpdateAvailable(player)
-            }, 100L) // 5秒延迟，避免被进服消息冲掉
+            }) // 5秒延迟，避免被进服消息冲掉
         }
     }
 
     @EventHandler
     fun onPlayerQuit(event: PlayerQuitEvent) {
+        plugin.itemBindingManager.clear(event.player.uniqueId)
+        MenuUI.discardPlayer(event.player)
+        DialogSessionManager.cancel(event.player)
         MenuTaskManager.cancel(event.player)
+        MenuListManager.clear(event.player)
         // 清理该玩家的元数据缓存
         plugin.metaDataManager.clearPlayerMeta(event.player.uniqueId)
     }
 
-    /**
-     * 检查两个材质名称是否匹配（使用规范化比较）
-     * @param itemMaterial 物品的材质名称（Material.name）
-     * @param targetMaterial 配置中的材质名称（可能包含短杠、空格、混合大小写）
-     * @return 是否匹配
-     */
-    private fun isMaterialMatch(itemMaterial: String, targetMaterial: String): Boolean {
-        // 尝试规范化目标材质名称并匹配
-        val normalizedTarget = MaterialUtils.normalizeMaterialName(targetMaterial)
-        return itemMaterial.equals(normalizedTarget, ignoreCase = true)
-    }
 }

@@ -3,8 +3,8 @@
 package org.katacr.kamenu
 
 import net.kyori.adventure.text.Component
-import net.kyori.adventure.text.minimessage.MiniMessage
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer
+import org.bukkit.entity.Player
 
 /**
  * 文本解析器
@@ -15,7 +15,11 @@ import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer
 object TextParser {
 
     private val serializer = LegacyComponentSerializer.legacyAmpersand()
-    private val miniMessage = MiniMessage.miniMessage()
+    // MiniMessage 4.26 无法运行在 Paper 1.16.5 内置的 Adventure 4.7.0 上。
+    // 延迟创建并统一走能力检测，避免仅使用 Legacy 文本时也触发链接错误。
+    private val miniMessage by lazy(LazyThreadSafetyMode.PUBLICATION) {
+        AdventureCompatibility.createMiniMessage()
+    }
 
     // ==================== 预编译正则表达式（性能优化） ====================
 
@@ -86,7 +90,11 @@ object TextParser {
      * 支持丰富的格式：<red>、<gradient:red:blue>、<bold> 等
      */
     fun miniMessage(text: String?): Component =
-        if (text == null) Component.empty() else miniMessage.deserialize(text)
+        if (text == null) {
+            Component.empty()
+        } else {
+            miniMessage?.deserialize(text) ?: color(text)
+        }
 
     /**
      * 智能解析文本格式（自动检测 MiniMessage 或 Legacy）
@@ -101,7 +109,21 @@ object TextParser {
      * @param text 文本内容
      * @return Adventure Component
      */
-    fun parseText(text: String?): Component {
+    fun parseText(text: String?): Component = parseText(text, null)
+
+    /**
+     * 使用玩家上下文智能解析文本，使 Oraxen 权限字形能够正确判定当前玩家。
+     *
+     * @param text 文本内容
+     * @param player 当前玩家；null 时使用不带权限上下文的 Oraxen Resolver
+     * @return Adventure Component
+     */
+    fun parseText(text: String?, player: Player?): Component = parseText(text, player, false)
+
+    /**
+     * 在完整文本已确认使用 Oraxen 时，强制让拆分后的 shift-only 片段复用 Oraxen Resolver。
+     */
+    internal fun parseText(text: String?, player: Player?, forceOraxenResolver: Boolean): Component {
         if (text == null) return Component.empty()
 
         // 1. 将简化的十六进制颜色代码转换为 MiniMessage 标签
@@ -110,7 +132,10 @@ object TextParser {
         // 2. 将简化的物品图标语法转换为 MiniMessage sprite 标签
         convertedText = convertItemSpriteToMiniMessage(convertedText)
 
-        // 3. 检测是否包含 MiniMessage 标签
+        // 3. Paper Dialog 不会触发 ItemsAdder 的监听器，需要主动解析内置字形和偏移标签
+        convertedText = ItemsAdderTextAdapter.replace(convertedText, player)
+
+        // 4. 检测是否包含 MiniMessage 标签
         val hasMiniMessageTags = convertedText.contains(MINI_MESSAGE_TAG_PATTERN)
 
         return if (hasMiniMessageTags) {
@@ -123,8 +148,8 @@ object TextParser {
                 convertedText
             }
 
-            // 使用 MiniMessage 解析，保留所有高级特性（点击、悬停、渐变等）
-            miniMessage(textToParse)
+            // Oraxen 字形需要其自定义 Resolver；其他文本继续使用标准 MiniMessage
+            OraxenTextAdapter.parse(textToParse, player, forceOraxenResolver) ?: miniMessage(textToParse)
         } else {
             // 使用 Legacy 颜色代码解析
             color(convertedText)

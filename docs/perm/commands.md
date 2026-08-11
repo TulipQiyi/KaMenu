@@ -1,4 +1,4 @@
-# ⌨️ 指令列表
+# 指令列表
 
 KaMenu 提供了简洁的指令体系，主指令为 `/km`（或 `/kamenu`、`/menu`）。
 
@@ -120,29 +120,223 @@ KaMenu 提供了简洁的指令体系，主指令为 `/km`（或 `/kamenu`、`/m
 
 ---
 
-### /km reload
+### /km guide
 
-重新加载插件的所有配置文件和菜单文件，无需重启服务器。
+打开内置入门向导菜单。
 
-**格式：** `/km reload`
+**格式：** `/km guide`
 
 **权限：** `kamenu.admin`
 
-**重载内容：**
-1. `config.yml` 全局配置
-2. 语言文件（`lang/` 目录）
-3. `menus/` 目录下的所有菜单文件（包括子文件夹）
-4. 自定义指令注册
+**使用说明：**
+- 向导菜单从插件 jar 内部加载到内存，不会写入 `menus` 目录
+- 支持 Dialog 的服务器核心会打开 Dialog 向导；不支持 Dialog 的低版本核心会自动打开箱子向导
+- 可用于首次配置语言、释放示例菜单、查看示例菜单说明
+- 当服务器没有加载任何菜单且 OP 玩家进入服务器时，KaMenu 会发送可点击文本引导打开该菜单
+
+**示例：**
+
+```bash
+/km guide
+/kamenu guide
+```
+
+---
+
+### /km language
+
+设置插件语言并立即重载配置和菜单。语言 ID 对应 `plugins/KaMenu/lang/` 下的 `.yml` 文件名，不含扩展名。
+
+**格式：** `/km language <语言ID>`
+
+**权限：** `kamenu.admin`
+
+**别名：** `/km lang <语言ID>`
+
+**示例：**
+
+```bash
+# 切换为简体中文
+/km language zh_CN
+
+# 切换为英文
+/km language en_US
+```
+
+---
+
+### /km examples
+
+按指定语言释放内置示例菜单到 `plugins/KaMenu/menus/example/`。
+
+**格式：** `/km examples [zh_CN|en_US] [overwrite]`
+
+**权限：** `kamenu.admin`
+
+**别名：** `/km example`、`/km release-examples`
+
+**使用说明：**
+- 不填写语言时，使用当前 `config.yml` 中的 `language`
+- 中文示例和英文示例都会释放到 `menus/example/`，不会生成 `exampleEN` 目录
+- 不支持 Dialog 的低版本核心只释放 `container_main`、`container_actions`、`container_furnace`、`container_anvil` 四个容器类菜单示例
+- 支持 Dialog 的核心会释放上述容器类菜单示例和全部 Dialog 示例
+- 平台变化不会删除 `menus/example/` 中已经存在的文件
+- 默认不会覆盖已有文件
+- 添加 `overwrite` 参数会覆盖已存在的同名示例菜单
+- 释放完成后会自动重载菜单
+
+**示例：**
+
+```bash
+# 按当前语言释放示例
+/km examples
+
+# 释放中文示例
+/km examples zh_CN
+
+# 释放英文示例
+/km examples en_US
+
+# 覆盖释放中文示例
+/km examples zh_CN overwrite
+```
+
+---
+
+### /km migrate dm
+
+将 DeluxeMenus 的箱子菜单转换为 KaMenu V2 容器类菜单。迁移器不会加载 DeluxeMenus，也不会执行源文件动作；生成后仍需在测试服中检查第三方物品、经济和指令插件行为。
+
+**格式：** `/km migrate dm [源文件或目录] [输出目录] [overwrite]`
+
+**权限：** `kamenu.admin`
+
+**说明：**
+- 省略源文件或目录时，默认扫描 `plugins/DeluxeMenus/gui_menus`
+- 源可以是单个 `.yml` 文件或包含多个 YAML 文件的目录
+- 输出目录相对于 `plugins/KaMenu/menus/`，省略时使用 `dm_migrated`
+- 默认不覆盖已有文件和同名自定义指令；使用 `overwrite` 才会覆盖两者
+- `open_command` 会转换为 `custom_commands.yml > custom-commands`，列表中的每个 DM 指令都会映射到迁移后的菜单 ID
+- 已有同名自定义指令默认保留并报告冲突，避免覆盖用户现有的菜单或动作指令
+- 迁移完成后会自动重载菜单、自定义指令和在线玩家的客户端命令树
+- 命令会逐文件输出成功结果和可定位到源 YAML 路径的 WARNING/ERROR
+
+**示例：**
+
+```bash
+/km migrate dm
+/km migrate dm overwrite
+/km migrate dm /path/to/DeluxeMenus/gui_menus
+/km migrate dm /path/to/DeluxeMenus/gui_menus overwrite
+/km migrate dm /path/to/DeluxeMenus/gui_menus dm_migrated overwrite
+/km open dm_migrated/requirements_menu
+```
+
+完整操作步骤、不兼容内容和报告说明见[菜单迁移总览](../container/migration.md#deluxemenus-迁移教程)。同槽位 `priority` 合并和状态变体规则见[容器类菜单按钮](../container/buttons.md#variants-状态变体)。
+
+---
+
+### /km migrate trmenu
+
+将 TrMenu stable-v3 的经典库存菜单编译为 KaMenu V2 标准容器类菜单。迁移器只读取源 YAML，不加载 TrMenu，也不会执行 Kether、JavaScript、指令或点击动作。
+
+**格式：** `/km migrate trmenu [源文件或目录] [输出目录] [overwrite]`
+
+**别名：** `/km migrate trm`
+
+**权限：** `kamenu.admin`
+
+**说明：**
+- 省略源路径时，默认扫描 `plugins/TrMenu/menus`
+- 输出目录相对于 `plugins/KaMenu/menus/`，省略时使用 `trmenu_migrated`
+- 默认保留已有菜单、同名自定义指令和物品绑定；使用 `overwrite` 才会覆盖
+- 普通 `Bindings.Commands` 会合并到 `custom_commands.yml`；正则指令绑定不会自动迁移
+- 可兼容的 `Bindings.Items` 会合并到 `item_bindings.yml`；不安全的物品 trait 会跳过并输出警告
+- 迁移器先建立全批次菜单 ID 映射，再转换跨文件 `open:` 动作
+- 每个生成文件都会再次经过 KaMenu 容器类菜单解析器校验；存在 ERROR 时不会写入目标
+- 完成后自动重载菜单、自定义指令、物品绑定和在线玩家的客户端命令树
+
+**示例：**
+
+```bash
+/km migrate trmenu
+/km migrate trm overwrite
+/km migrate trmenu /path/to/TrMenu/menus trmenu_migrated overwrite
+/km open trmenu_migrated/example
+```
+
+支持范围、拒绝策略和 `TRM_*` 诊断代码说明见[菜单迁移总览](../container/migration.md#trmenu-迁移)。
+
+---
+
+### /km pause
+
+生成或移除 ESC 暂停菜单入口数据包。`register` 会读取插件根目录的 `pause_menu.yml`，并将其中的静态 KaMenu 风格布局编译为原版 Dialog。
+
+该指令仅在 Paper/Folia 及提供兼容 Paper custom click API 的衍生核心可用；Spigot 会返回不支持提示。
+
+**格式：**
+- `/km pause register` - 按当前 `plugins/KaMenu/pause_menu.yml` 生成入口数据包
+- `/km pause unregister` - 移除 KaMenu 生成的入口数据包
+- `/km pause info` - 查看当前入口状态和数据包路径
+
+**权限：** `kamenu.admin`
+
+**示例：**
+
+```bash
+/km pause register
+/km pause info
+/km pause unregister
+```
+
+**使用说明：**
+- 数据包写入 `world/datapacks/KaMenuPauseEntry`
+- 插件启动时若缺少 `pause_menu.yml`，会自动释放默认模板且不会覆盖已有文件
+- 新增、修改或移除后必须完整重启服务器才会影响 ESC 暂停菜单
+- KaMenu 只注册一个 ESC 入口；可在 `Bottom.buttons` 中配置该入口内部的按钮矩阵
+- `Body.message` 支持 Legacy、MiniMessage 和静态 `<text=...>` 可点击文本
+- 支持静态 `Inputs`；配置 `actions` 的按钮可通过 `$(key)` 接收客户端输入
+- 标题、Body、输入标签和按钮文本不解析运行期变量；按钮 `actions` 回调可使用 PAPI、KaMenu 变量、条件、JS 和动作包
+- `menu` 按钮打开的目标菜单仍按普通 KaMenu 菜单完整解析
+- 完整语法见 [ESC 暂停菜单](../config/pause-menu.md)
+
+---
+
+### /km reload
+
+重新加载插件配置、菜单或资源包，无需重启服务器。不填写目标时默认重载全部。
+
+**格式：** `/km reload [all|menu|actions|js|lang|config]`
+
+**权限：** `kamenu.admin`
+
+**目标：**
+
+| 目标 | 说明 |
+|------|------|
+| `all` | 重载全部模块，等同于不填写目标 |
+| `menu` | 仅重载 `menus/` 目录下的菜单文件 |
+| `actions` | 仅重载 `plugins/KaMenu/actions/` 全局动作包 |
+| `js` | 仅重载 `plugins/KaMenu/js/` 全局 JavaScript 包 |
+| `lang` | 仅重载当前语言文件 |
+| `config` | 重载 `config.yml`、`custom_commands.yml`、语言文件和自定义指令 |
+
+每个目标都会返回独立统计：总数、成功、失败、耗时 ms。`config` 的统计对象是 `custom-commands` 中的自定义指令；不填写目标或使用 `all` 时，会依次输出各模块的重载结果。
 
 **示例：**
 
 ```bash
 /km reload
-# 输出: [KaMenu] 菜单已重载，共加载 12 个菜单和 3 个自定义指令。
+/km reload menu
+/km reload actions
+/km reload js
+/km reload lang
+/km reload config
 ```
 
 {% hint style="info" %}
-修改菜单文件后，只需执行 `/km reload` 即可立即生效，无需重启服务器。
+仅修改菜单文件时，推荐执行 `/km reload menu`；需要同时重载全部模块时再使用 `/km reload`。
 {% endhint %}
 
 ---
@@ -226,18 +420,11 @@ KaMenu 提供了简洁的指令体系，主指令为 `/km`（或 `/kamenu`、`/m
 **使用说明：** 该指令支持玩家和控制台使用，必须指定目标玩家。
 
 **支持的动作类型：**
-- `tell:消息` - 发送聊天消息
-- `actionbar:消息` - 发送 ActionBar 消息
-- `title:参数` - 发送标题
-- `sound:参数` - 播放声音
-- `command:指令` - 玩家执行指令
-- `console:指令` - 控制台执行指令
-- `data:操作` - 玩家数据操作
-- `gdata:操作` - 全局数据操作
-- `meta:操作` - 元数据操作
+- 支持所有服务端执行的动作前缀，例如 `tell:`、`actionbar:`、`title:`、`hovertext:`、`command:`、`chat:`、`console:`、`sound:`、`open:`、`force-open:`、`close`、`force-close`、`reset`、`server:`、`tppos:`、`data:`、`gdata:`、`list:`、`glist:`、`meta:`、`toast:`、`money:`、`stock-item:`、`item:`、`js:` 等。
+- `wait`、`return`、`run-task:`、`stop-task:`、`stop-current-task`、`page:`、`actions:` 等动作链/菜单上下文动作可以输入，但部分效果依赖当前菜单配置或任务生命周期。
+- `url:` 和 `copy:` 是 Paper Dialog 按钮的静态点击事件，只在菜单按钮中作为单动作使用，不适合作为 `/km action` 测试目标。
 
-
-  详细动作类型请参阅 [🤖 动作 (Actions)](../menu/actions.md)。
+详细动作类型请参阅 [动作 (Actions)](../modern-dialog/actions.md)。
 
 ---
 
@@ -262,7 +449,7 @@ KaMenu 提供了简洁的指令体系，主指令为 `/km`（或 `/kamenu`、`/m
 
 **Tab 补全：**
 - 输入 `/km action ` 后按 Tab 键，会显示所有在线玩家
-- 输入玩家名后按 Tab 键，会显示常用动作前缀
+- 输入玩家名后按 Tab 键，会显示已支持的服务端动作前缀
 
 {% hint style="info" %}
 该指令支持所有内置变量（`{data:var}`、`{gdata:var}`、`{meta:var}`）和 PlaceholderAPI 变量（`%player_name%` 等）。
@@ -272,7 +459,7 @@ KaMenu 提供了简洁的指令体系，主指令为 `/km`（或 `/kamenu`、`/m
 
 ## 自定义快捷指令
 
-除了 `/km open` 之外，你还可以在 `config.yml` 中注册自定义快捷指令，直接将一个简短的指令映射到打开某个菜单：
+除了 `/km open` 之外，你还可以在插件根目录的 `custom_commands.yml` 中注册自定义快捷指令，直接将一个简短的指令映射到打开某个菜单：
 
 ```yaml
 custom-commands:
@@ -280,4 +467,4 @@ custom-commands:
   menu: 'main_menu'     # 玩家执行 /menu 即打开 main_menu 菜单
 ```
 
-详细配置请参阅 [⌨️ 自定义指令](../home/commands.md)。
+详细配置请参阅 [自定义指令](../config/customCommands.md)。

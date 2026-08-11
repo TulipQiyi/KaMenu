@@ -1,6 +1,7 @@
 package org.katacr.kamenu
 
 import org.bukkit.configuration.ConfigurationSection
+import org.bukkit.configuration.file.YamlConfiguration
 import org.bukkit.entity.Player
 
 /**
@@ -25,11 +26,42 @@ object ConditionUtils {
         return ConditionExpressionEngine.checkCondition(player, condition)
     }
 
+    fun checkCondition(player: Player, condition: String?, variables: Map<String, String>): Boolean {
+        return ConditionExpressionEngine.checkCondition(player, condition, variables)
+    }
+
+    fun checkCondition(
+        player: Player,
+        condition: String?,
+        variables: Map<String, String>,
+        dynamicResolver: (String) -> String?
+    ): Boolean {
+        return ConditionExpressionEngine.checkCondition(player, condition, variables, dynamicResolver)
+    }
+
+    fun checkCondition(
+        player: Player,
+        condition: String?,
+        variables: Map<String, String>,
+        menuConfig: YamlConfiguration?,
+        dynamicResolver: (String) -> String?
+    ): Boolean {
+        return ConditionExpressionEngine.checkCondition(player, condition, variables, menuConfig, dynamicResolver)
+    }
+
     fun getConditionString(
         player: Player,
         conditionMap: Map<*, *>,
         defaultValue: String = ""
     ): String = ConditionValueResolver.getConditionString(player, conditionMap, defaultValue)
+
+    /** 解析条件字符串，并向底层传递当前菜单配置。 */
+    fun getConditionString(
+        player: Player,
+        conditionMap: Map<*, *>,
+        defaultValue: String,
+        menuConfig: YamlConfiguration?
+    ): String = ConditionValueResolver.getConditionString(player, conditionMap, defaultValue, menuConfig)
 
     fun getConditionList(
         player: Player,
@@ -37,11 +69,27 @@ object ConditionUtils {
         defaultValue: List<String> = emptyList()
     ): List<String> = ConditionValueResolver.getConditionList(player, conditionMap, defaultValue)
 
+    /** 解析条件字符串列表，并向底层传递当前菜单配置。 */
+    fun getConditionList(
+        player: Player,
+        conditionMap: Map<*, *>,
+        defaultValue: List<String>,
+        menuConfig: YamlConfiguration?
+    ): List<String> = ConditionValueResolver.getConditionList(player, conditionMap, defaultValue, menuConfig)
+
     fun getConditionStringOrList(
         player: Player,
         conditionMap: Map<*, *>,
         defaultValue: String = ""
     ): String = ConditionValueResolver.getConditionStringOrList(player, conditionMap, defaultValue)
+
+    /** 解析字符串或列表条件值，并向底层传递当前菜单配置。 */
+    fun getConditionStringOrList(
+        player: Player,
+        conditionMap: Map<*, *>,
+        defaultValue: String,
+        menuConfig: YamlConfiguration?
+    ): String = ConditionValueResolver.getConditionStringOrList(player, conditionMap, defaultValue, menuConfig)
 
     fun getFirstConditionString(
         player: Player,
@@ -49,17 +97,41 @@ object ConditionUtils {
         defaultValue: String = ""
     ): String = ConditionValueResolver.getFirstConditionString(player, conditions, defaultValue)
 
+    /** 选择首个匹配字符串，并向底层传递当前菜单配置。 */
+    fun getFirstConditionString(
+        player: Player,
+        conditions: List<*>,
+        defaultValue: String,
+        menuConfig: YamlConfiguration?
+    ): String = ConditionValueResolver.getFirstConditionString(player, conditions, defaultValue, menuConfig)
+
     fun getFirstConditionList(
         player: Player,
         conditions: List<*>,
         defaultValue: List<String> = emptyList()
     ): List<String> = ConditionValueResolver.getFirstConditionList(player, conditions, defaultValue)
 
+    /** 选择首个匹配字符串列表，并向底层传递当前菜单配置。 */
+    fun getFirstConditionList(
+        player: Player,
+        conditions: List<*>,
+        defaultValue: List<String>,
+        menuConfig: YamlConfiguration?
+    ): List<String> = ConditionValueResolver.getFirstConditionList(player, conditions, defaultValue, menuConfig)
+
     fun getFirstConditionStringOrList(
         player: Player,
         conditions: List<*>,
         defaultValue: String = ""
     ): String = ConditionValueResolver.getFirstConditionStringOrList(player, conditions, defaultValue)
+
+    /** 选择首个匹配字符串或列表，并向底层传递当前菜单配置。 */
+    fun getFirstConditionStringOrList(
+        player: Player,
+        conditions: List<*>,
+        defaultValue: String,
+        menuConfig: YamlConfiguration?
+    ): String = ConditionValueResolver.getFirstConditionStringOrList(player, conditions, defaultValue, menuConfig)
 
     fun getString(
         player: Player,

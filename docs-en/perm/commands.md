@@ -1,4 +1,4 @@
-# ⌨️ Command List
+# Command List
 
 KaMenu provides a concise command structure. The main command is `/km` (aliases: `/kamenu`, `/menu`).
 
@@ -120,29 +120,223 @@ View all loaded menus on the server.
 
 ---
 
-### /km reload
+### /km guide
 
-Reloads all plugin configuration files and menu files without restarting the server.
+Opens the built-in getting started guide menu.
 
-**Format:** `/km reload`
+**Format:** `/km guide`
 
 **Permission:** `kamenu.admin`
 
-**Reloaded items:**
-1. `config.yml` global configuration
-2. Language files (`lang/` directory)
-3. All menu files in the `menus/` directory (including subfolders)
-4. Custom command registrations
+**Notes:**
+- The guide menu is loaded from inside the plugin jar into memory and is not written to the `menus` directory
+- Servers with Dialog support open the Dialog guide; older platforms without Dialog support automatically open the container guide
+- It helps with first-time language setup, example release, and example menu descriptions
+- When no menus are loaded and an OP player joins the server, KaMenu sends a clickable prompt to open this guide
+
+**Examples:**
+
+```bash
+/km guide
+/kamenu guide
+```
+
+---
+
+### /km language
+
+Sets the plugin language and immediately reloads configuration and menus. The language ID is the `.yml` filename under `plugins/KaMenu/lang/`, without the extension.
+
+**Format:** `/km language <language_id>`
+
+**Permission:** `kamenu.admin`
+
+**Alias:** `/km lang <language_id>`
+
+**Examples:**
+
+```bash
+# Switch to Simplified Chinese
+/km language zh_CN
+
+# Switch to English
+/km language en_US
+```
+
+---
+
+### /km examples
+
+Releases built-in sample menus for the selected language to `plugins/KaMenu/menus/example/`.
+
+**Format:** `/km examples [zh_CN|en_US] [overwrite]`
+
+**Permission:** `kamenu.admin`
+
+**Aliases:** `/km example`, `/km release-examples`
+
+**Notes:**
+- If no language is specified, KaMenu uses the current `language` in `config.yml`
+- Both Chinese and English examples are released to `menus/example/`; no runtime `exampleEN` directory is created
+- Older platforms without Dialog support release only four Container examples: `container_main`, `container_actions`, `container_furnace`, and `container_anvil`
+- Platforms with Dialog support release those Container examples plus all Dialog examples
+- Changing platforms does not delete files that already exist under `menus/example/`
+- Existing files are skipped by default
+- Add `overwrite` to replace existing sample menus with the same names
+- Menus are automatically reloaded after release
+
+**Examples:**
+
+```bash
+# Release examples using the current language
+/km examples
+
+# Release Chinese examples
+/km examples zh_CN
+
+# Release English examples
+/km examples en_US
+
+# Overwrite Chinese examples
+/km examples zh_CN overwrite
+```
+
+---
+
+### /km migrate dm
+
+Converts DeluxeMenus chest menus into KaMenu V2 Container menus. The converter does not load DeluxeMenus or execute source actions; review third-party item, economy, and command integrations on a test server after generation.
+
+**Format:** `/km migrate dm [source-file-or-directory] [output-directory] [overwrite]`
+
+**Permission:** `kamenu.admin`
+
+**Notes:**
+- When the source is omitted, KaMenu scans `plugins/DeluxeMenus/gui_menus` by default
+- The source may be one `.yml` file or a directory containing YAML files
+- The output directory is relative to `plugins/KaMenu/menus/`; the default is `dm_migrated`
+- Existing files and same-name custom commands are preserved by default; use `overwrite` to replace both
+- `open_command` is converted into `custom_commands.yml > custom-commands`; every command in a DM list is mapped to the migrated menu ID
+- Existing same-name custom commands are preserved and reported as conflicts by default, avoiding accidental replacement of menu or action commands
+- KaMenu reloads menus, custom commands, and online players' client command trees after migration
+- The command reports per-file success and WARNING/ERROR entries with source YAML paths
+
+**Examples:**
+
+```bash
+/km migrate dm
+/km migrate dm overwrite
+/km migrate dm /path/to/DeluxeMenus/gui_menus
+/km migrate dm /path/to/DeluxeMenus/gui_menus overwrite
+/km migrate dm /path/to/DeluxeMenus/gui_menus dm_migrated overwrite
+/km open dm_migrated/requirements_menu
+```
+
+See [Menu Migration Overview](../container/migration.md#deluxemenus-migration-tutorial) for the complete workflow, incompatibilities, and report format. See [Container Buttons](../container/buttons.md#variants) for same-slot `priority` merging and state variant rules.
+
+---
+
+### /km migrate trmenu
+
+Compiles classic TrMenu stable-v3 inventory menus into standard KaMenu V2 Container menus. The migrator only reads source YAML. It does not load TrMenu or execute Kether, JavaScript, commands, or click actions.
+
+**Format:** `/km migrate trmenu [source-file-or-directory] [output-directory] [overwrite]`
+
+**Alias:** `/km migrate trm`
+
+**Permission:** `kamenu.admin`
+
+**Notes:**
+- When the source is omitted, KaMenu scans `plugins/TrMenu/menus`
+- The output directory is relative to `plugins/KaMenu/menus/`; the default is `trmenu_migrated`
+- Existing menus, same-name custom commands, and item bindings are preserved unless `overwrite` is supplied
+- Plain `Bindings.Commands` entries are merged into `custom_commands.yml`; regex bindings are not converted automatically
+- Compatible `Bindings.Items` entries are merged into `item_bindings.yml`; unsafe item traits are skipped with diagnostics
+- The migrator builds the complete batch menu-ID map before converting cross-file `open:` actions
+- Every generated file is parsed again by KaMenu's Container parser; a file with any ERROR is not written
+- Menus, custom commands, item bindings, and online players' client command trees are reloaded after migration
+
+**Examples:**
+
+```bash
+/km migrate trmenu
+/km migrate trm overwrite
+/km migrate trmenu /path/to/TrMenu/menus trmenu_migrated overwrite
+/km open trmenu_migrated/example
+```
+
+See [Menu Migration Overview](../container/migration.md#trmenu-migration) for supported features, rejection rules, and `TRM_*` diagnostic codes.
+
+---
+
+### /km pause
+
+Generates or removes the ESC pause screen entry datapack. `register` reads `pause_menu.yml` from the plugin root and compiles its static KaMenu-style layout into a vanilla Dialog.
+
+This command is available only on Paper/Folia and forks exposing the compatible Paper custom-click API. Spigot returns an unsupported-platform message.
+
+**Format:**
+- `/km pause register` — Generate the entry datapack from `plugins/KaMenu/pause_menu.yml`
+- `/km pause unregister` — Remove the datapack generated by KaMenu
+- `/km pause info` — Show current entry status and datapack path
+
+**Permission:** `kamenu.admin`
+
+**Examples:**
+
+```bash
+/km pause register
+/km pause info
+/km pause unregister
+```
+
+**Notes:**
+- The datapack is written to `world/datapacks/KaMenuPauseEntry`
+- KaMenu releases the default `pause_menu.yml` during startup when the file is missing and never overwrites an existing file
+- Adding, changing, or removing it requires a full server restart before the ESC pause screen changes
+- KaMenu registers one ESC entry; configure its internal button matrix under `Bottom.buttons`
+- `Body.message` supports Legacy, MiniMessage, and static `<text=...>` clickable text
+- Static `Inputs` are supported; buttons with `actions` receive client input through `$(key)`
+- Titles, Body, input labels, and button text do not resolve runtime values; button `actions` may use PAPI, KaMenu variables, conditions, JavaScript, and action packages
+- A target opened through `menu` is still parsed as a complete regular KaMenu menu
+- See [ESC Pause Menu](../config/pause-menu.md) for the full syntax
+
+---
+
+### /km reload
+
+Reloads plugin configuration, menus, or package folders without restarting the server. If no target is provided, KaMenu reloads everything.
+
+**Format:** `/km reload [all|menu|actions|js|lang|config]`
+
+**Permission:** `kamenu.admin`
+
+**Targets:**
+
+| Target | Description |
+|--------|-------------|
+| `all` | Reload all modules. Same as omitting the target |
+| `menu` | Reload only menu files under `menus/` |
+| `actions` | Reload only global action packages under `plugins/KaMenu/actions/` |
+| `js` | Reload only global JavaScript packages under `plugins/KaMenu/js/` |
+| `lang` | Reload only the current language file |
+| `config` | Reload `config.yml`, `custom_commands.yml`, language files, and custom commands |
+
+Each target returns its own statistics: total, success, failed, and elapsed ms. For `config`, the counted items are custom commands under `custom-commands`. When no target is provided, or when `all` is used, KaMenu prints each module's reload result in sequence.
 
 **Example:**
 
 ```bash
 /km reload
-# Output: [KaMenu] Menus reloaded. Loaded 12 menus and 3 custom commands.
+/km reload menu
+/km reload actions
+/km reload js
+/km reload lang
+/km reload config
 ```
 
 {% hint style="info" %}
-After modifying menu files, simply run `/km reload` to apply changes immediately — no server restart required.
+After modifying menu files only, prefer `/km reload menu`. Use `/km reload` when all modules should be reloaded.
 {% endhint %}
 
 ---
@@ -226,18 +420,11 @@ Test and execute a specified action for debugging and verifying action configura
 **Notes:** This command can be used by both players and the console; a target player must always be specified.
 
 **Supported action types:**
-- `tell:message` — Send a chat message
-- `actionbar:message` — Send an ActionBar message
-- `title:params` — Send a title
-- `sound:params` — Play a sound
-- `command:command` — Player executes a command
-- `console:command` — Console executes a command
-- `data:operation` — Player data operation
-- `gdata:operation` — Global data operation
-- `meta:operation` — Metadata operation
+- Supports all server-executed action prefixes, such as `tell:`, `actionbar:`, `title:`, `hovertext:`, `command:`, `chat:`, `console:`, `sound:`, `open:`, `force-open:`, `close`, `force-close`, `reset`, `server:`, `tppos:`, `data:`, `gdata:`, `list:`, `glist:`, `meta:`, `toast:`, `money:`, `stock-item:`, `item:`, `js:`, and more.
+- Action-chain or menu-context actions such as `wait`, `return`, `run-task:`, `stop-task:`, `stop-current-task`, `page:`, and `actions:` can be entered, but some effects depend on the current menu config or task lifecycle.
+- `url:` and `copy:` are Paper Dialog static button click events. They only work as a single menu button action and are not useful `/km action` test targets.
 
-
-  For a full list of action types, see [🤖 Actions](../menu/actions.md).
+For a full list of action types, see [Actions](../modern-dialog/actions.md).
 
 ---
 
@@ -262,7 +449,7 @@ Test and execute a specified action for debugging and verifying action configura
 
 **Tab completion:**
 - After `/km action `, Tab shows all online players
-- After a player name, Tab shows common action prefixes
+- After a player name, Tab shows supported server action prefixes
 
 {% hint style="info" %}
 This command supports all built-in variables (`{data:var}`, `{gdata:var}`, `{meta:var}`) and PlaceholderAPI variables (`%player_name%`, etc.).
@@ -272,7 +459,7 @@ This command supports all built-in variables (`{data:var}`, `{gdata:var}`, `{met
 
 ## Custom Quick Commands
 
-In addition to `/km open`, you can register custom quick commands in `config.yml` that map a short command directly to opening a specific menu:
+In addition to `/km open`, you can register custom quick commands in the plugin root file `custom_commands.yml` that map a short command directly to opening a specific menu:
 
 ```yaml
 custom-commands:
@@ -280,4 +467,4 @@ custom-commands:
   menu: 'main_menu'     # Players run /menu to open main_menu
 ```
 
-For detailed configuration, see [⌨️ Custom Commands](../home/commands.md).
+For detailed configuration, see [Custom Commands](../config/customCommands.md).

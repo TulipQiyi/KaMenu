@@ -1,6 +1,6 @@
-# 📊 玩家数据与全局数据
+# 数据存储
 
-KaMenu 内置了键值对存储系统，无需额外插件即可在菜单中持久化读写数据。
+KaMenu 内置了数据存储系统，无需额外插件即可在菜单中持久化读写玩家数据、全局数据、玩家列表和全局列表。
 
 ---
 
@@ -14,8 +14,20 @@ KaMenu 内置了键值对存储系统，无需额外插件即可在菜单中持�
 
 ```yaml
 actions:
-  - 'set-data: <键名> <值>'
+  - 'data: type=set;key=<键名>;var=<值>'
+  - 'data: type=add;key=<键名>;var=<数字>'
+  - 'data: type=take;key=<键名>;var=<数字>'
+  - 'data: type=delete;key=<键名>'
 ```
+
+`type` 支持：
+
+- `set`：设置文本或数字值
+- `add`：增加数字值
+- `take`：减少数字值
+- `delete`：删除该键
+
+简写格式 `set-data: <键名> <值>` 也可使用，适合只需要设置一个值的场景；需要 `add` / `take` / `delete` 时使用 `data:` 参数写法。
 
 **读取（任意文本位置）：**
 
@@ -29,15 +41,36 @@ actions:
 ```yaml
 # 写入
 actions:
-  - 'set-data: vip_level 3'
-  - 'set-data: nickname $(input_nickname)'
+  - 'data: type=set;key=vip_level;var=`3`'
+  - 'data: type=set;key=nickname;var=`$(input_nickname)`'
+  - 'data: type=add;key=points;var=`10`'
+  - 'data: type=take;key=points;var=`5`'
 
 # 读取 - 在菜单文字中
 text: '&7你的 VIP 等级: &6{data:vip_level}'
 text: '&7你的昵称: &f{data:nickname}'
+text: '&7你的积分: &e{data:points}'
 
 # 读取 - 在条件判断中
 condition: '{data:vip_level} >= 2'
+```
+
+**应用示例：记录玩家是否领取过礼包**
+
+```yaml
+Bottom:
+  type: notice
+  confirm:
+    text: '&a[ 领取礼包 ]'
+    actions:
+      - condition: "{data:first_gift} == true"
+        allow:
+          - 'toast: type=error;msg=已经领过;icon=barrier'
+          - 'return'
+        deny:
+          - 'data: type=set;key=first_gift;var=`true`'
+          - 'item: type=give;mats=APPLE;amount=5'
+          - 'toast: type=task;msg=领取成功;icon=apple'
 ```
 
 ---
@@ -50,8 +83,13 @@ condition: '{data:vip_level} >= 2'
 
 ```yaml
 actions:
-  - 'set-gdata: <键名> <值>'
+  - 'gdata: type=set;key=<键名>;var=<值>'
+  - 'gdata: type=add;key=<键名>;var=<数字>'
+  - 'gdata: type=take;key=<键名>;var=<数字>'
+  - 'gdata: type=delete;key=<键名>'
 ```
+
+`type` 与 `data:` 相同。简写格式 `set-gdata: <键名> <值>` 也可使用，适合只需要设置一个全局值的场景；需要 `add` / `take` / `delete` 时使用 `gdata:` 参数写法。
 
 **读取（任意文本位置）：**
 
@@ -65,16 +103,139 @@ actions:
 ```yaml
 # 写入
 actions:
-  - 'set-gdata: server_event active'
-  - 'set-gdata: event_winner %player_name%'
+  - 'gdata: type=set;key=server_event;var=`active`'
+  - 'gdata: type=set;key=event_winner;var=`%player_name%`'
+  - 'gdata: type=add;key=event_join_count;var=`1`'
 
 # 读取 - 在菜单文字中
 text: '&7服务器活动状态: &a{gdata:server_event}'
 text: '&7活动获胜者: &e{gdata:event_winner}'
+text: '&7活动参与次数: &f{gdata:event_join_count}'
 
 # 读取 - 在条件判断中
 condition: '{gdata:server_event} == active'
 ```
+
+**应用示例：全服活动报名计数**
+
+```yaml
+Bottom:
+  type: notice
+  confirm:
+    text: '&b[ 报名活动 ]'
+    actions:
+      - 'gdata: type=add;key=event_join_count;var=`1`'
+      - 'toast: type=task;msg=报名成功;icon=emerald'
+      - 'reset'
+
+Body:
+  event_info:
+    type: message
+    text:
+      - '&a当前活动状态: &f{gdata:server_event}'
+      - '&e报名人数: &f{gdata:event_join_count}'
+```
+
+---
+
+### 玩家私有列表 (Per-Player List)
+
+以单个玩家 UUID 为作用域的私有字符串列表，不是当前服务器在线玩家列表。列表以 JSON 数组字符串保存到玩家数据键中，适合好友列表、传送点 ID 列表、收藏列表、任务记录等简单字符串集合。
+
+**写入（动作中）：**
+
+```yaml
+actions:
+  - 'list: type=set;key=friends;var=`Steve,Alex`;split=,'
+  - 'list: type=add;key=friends;var=`Notch`'
+  - 'list: type=remove;key=friends;var=`Alex`'
+  - 'list: type=clear;key=friends'
+```
+
+**读取与判断：**
+
+| 方式 | 格式 | 说明 |
+|------|------|------|
+| 内置变量 | `{list:friends}` | 返回当前玩家自己的 `friends` 列表 JSON，例如 `["Steve","Notch"]` |
+| PAPI 变量 | `%kamenu_list_friends%` | 通过 PlaceholderAPI 读取列表 JSON |
+| PAPI 数量 | `%kamenu_list_size_friends%` | 读取列表项目数量 |
+| 条件方法 | `inList.Steve;{list:friends}` | 判断值是否在列表中 |
+| JavaScript | `JSON.parse(list("friends"))` | 在 JS 内读取并转成数组 |
+
+**用于动态按钮：**
+
+```yaml
+Bottom:
+  type: multi
+  buttons:
+    friends:
+      type: repeat
+      source: "{list:friends}"
+      item:
+        text: "&a{item.value}"
+        actions:
+          - "tell: 你点击了 {item.value}"
+```
+
+**应用示例：玩家私有收藏服务器列表**
+
+```yaml
+Bottom:
+  type: multi
+  buttons:
+    add_survival:
+      text: '&a[ 收藏生存服 ]'
+      actions:
+        - 'list: type=add;key=favorite_servers;var=`survival`'
+        - 'toast: type=task;msg=已收藏;icon=emerald'
+        - 'reset'
+
+    favorites:
+      type: repeat
+      source: "{list:favorite_servers}"
+      item:
+        text: "&b{item.value}"
+        actions:
+          - "server: {item.value}"
+```
+
+---
+
+### 全局列表 (Global List)
+
+所有玩家共享的字符串列表。用法与 `list` 相同，但通过 `glist:` 动作写入，使用 `{glist:key}` / `%kamenu_glist_key%` / `glist("key")` 读取。
+
+**示例：**
+
+```yaml
+actions:
+  - 'glist: type=set;key=servers;var=`survival,skyblock,resource`;split=,'
+  - 'glist: type=add;key=vip_players;var=`%player_name%`'
+```
+
+```yaml
+condition: "inGlist.%player_name%;{glist:vip_players}"
+text: "&7服务器数量: %kamenu_glist_size_servers%"
+```
+
+**应用示例：全局 VIP 名单判断**
+
+```yaml
+Events:
+  Open:
+    - condition: "inGlist.%player_name%;{glist:vip_players}"
+      allow:
+        - 'toast: type=task;msg=欢迎VIP;icon=diamond'
+      deny:
+        - 'toast: type=error;msg=非VIP;icon=barrier'
+```
+
+**注意：**
+
+- `add` 默认 `unique=true`，已存在的项目不会重复添加；需要重复记录时设置 `unique=false`
+- `set` / `add` / `remove` 的 `var` 支持单个字符串、JSON 数组字符串，或配合 `split` / `separator` 拆分简单列表
+- `remove` / `take` 会移除所有完全匹配的项目
+- `list/glist` 仍是持久化数据库数据，高频刷新菜单时应避免每次渲染都写入
 
 ---
 
@@ -122,7 +283,7 @@ Bottom:
           - 'actionbar: &c今日已签到！请明天再来。'
           - 'sound: block.note_block.bass'
         deny:
-          - 'set-data: last_sign %server_time_YYYYMMdd%'
+          - 'data: type=set;key=last_sign;var=`%server_time_YYYYMMdd%`'
           - 'console: eco give %player_name% 100'
           - 'console: give %player_name% diamond 1'
           - 'tell: &a签到成功！获得 100 金币和 1 颗钻石。'
@@ -150,8 +311,8 @@ Events:
   Open:
     - condition: '{data:last_day} != %server_time_YYYYMMdd%'
       allow:
-        - 'set-data: last_day %server_time_YYYYMMdd%'
-        - 'set-data: diamond_amount 100'
+        - 'data: type=set;key=last_day;var=`%server_time_YYYYMMdd%`'
+        - 'data: type=set;key=diamond_amount;var=`100`'
         - 'tell: &a欢迎进入钻石商店，今日钻石数量已补货。'
         - 'wait: 1'
 
@@ -216,13 +377,13 @@ Bottom:
 
 数据存储的后端数据库可在 `config.yml` 中配置，支持 SQLite 和 MySQL 两种方式。
 
-详细配置请参阅 [⛳ 配置文件: config.yml](../config/config.md)。
+详细配置请参阅 [配置文件: config.yml](../config/config.md)。
 
 ---
 
 ## 数据表结构（参考）
 
-KaMenu 在数据库中创建以下两张表：
+KaMenu 在数据库中创建以下数据表：
 
 **player_data 表（玩家数据）：**
 
@@ -233,6 +394,10 @@ KaMenu 在数据库中创建以下两张表：
 | `data_key` | VARCHAR(64) | 数据键名 |
 | `data_value` | TEXT | 数据值 |
 | `update_time` | BIGINT | 最后更新时间戳 |
+
+{% hint style="info" %}
+`list` 使用 `player_data` 表保存 JSON 数组字符串，`glist` 使用 `global_data` 表保存 JSON 数组字符串，不会额外创建独立列表表。
+{% endhint %}
 
 **global_data 表（全局数据）：**
 

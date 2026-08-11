@@ -9,8 +9,11 @@ import java.net.http.HttpResponse
 import java.time.Duration
 
 /**
- * 更新检查器
- * 从 GitHub 获取最新版本号，对比当前版本，向 OP 玩家发送更新提示
+ * 更新检查器。
+ *
+ * 异步从 GitHub 的 plugin.yml 获取最新版本号，对比当前插件版本，
+ * 并在 OP 玩家进服时发送带 MineBBS / SpigotMC 链接的可点击提示。
+ * 网络失败会静默忽略，不影响插件启动。
  */
 object UpdateChecker {
 
@@ -55,7 +58,7 @@ object UpdateChecker {
         languageManager = plugin.languageManager
         latestVersion = null
         checkComplete = false
-        Bukkit.getScheduler().runTaskAsynchronously(plugin, Runnable {
+        KaScheduler.runAsync(Runnable {
             try {
                 val request = HttpRequest.newBuilder()
                     .uri(URI.create(PLUGIN_YML_URL))
@@ -88,7 +91,7 @@ object UpdateChecker {
         val msg = languageManager?.getMessage("plugin.update_available", latest, current)
             ?: "&e[KaMenu] &fNew version available: &a$latest&f, current: &7$current"
         val hoverText = parseUpdateMessage(msg)
-        player.sendMessage(MenuActions.parseClickableText(hoverText))
+        MenuUI.sendMessage(player, MenuActions.parseClickableText(hoverText))
     }
 
     /**

@@ -1,10 +1,10 @@
-# ⛳ 配置文件: config.yml
+# 配置文件: config.yml
 
 `config.yml` 是 KaMenu 的全局配置文件，位于 `plugins/KaMenu/config.yml`。
 
 ---
 
-## 📋 完整示例
+## 完整示例
 
 ```yaml
 # KaMenu 全局配置文件
@@ -14,6 +14,18 @@ language: 'zh_CN'
 
 # BungeeCord 支持（用于 server: 动作）
 bungeecord: true
+
+# 输入捕获配置
+input-capture:
+  # 动作和条件读取 $(input_key) 前，是否移除文本输入内容前后的空格
+  trim-edge-spaces: false
+  # 输入框 remove_chars 可引用的全局字符移除列表
+  remove-char-lists:
+    global:
+      - '&'
+      - '_'
+      - '\s'
+      - '\n'
 
 # 数据库配置
 storage:
@@ -31,7 +43,7 @@ listeners:
   swap-hand:
     enabled: true
     # 触发时打开的菜单文件名
-    menu: 'main_menu'
+    menu: 'example/main_menu'
     # 是否需要潜行时才触发
     require-sneaking: true
 
@@ -40,7 +52,7 @@ listeners:
     # 启用此监听器
     enabled: true
     # 要打开的菜单文件路径
-    menu: 'inspect_player'
+    menu: 'example/inspect_player'
     # 需要潜行才能触发（Shift+右键）
     require-sneaking: true 
     
@@ -53,7 +65,7 @@ listeners:
       # 目标 Lore 文本（包含该文本即匹配）
       target-lore: '菜单'
       # 触发时打开的菜单文件名
-      menu: 'main_menu'
+      menu: 'example/main_menu'
       # 是否需要潜行时才触发
       require-sneaking: false
     # 可以添加更多配置...
@@ -64,17 +76,11 @@ listeners:
     #   menu: 'server_shop'
     #   require-sneaking: false
 
-# 自定义指令注册
-# 格式: 指令名: 菜单文件名
-custom-commands:
-  zcd: 'main_menu'
-  shop: 'server_shop'
-  menu: 'main_menu'
 ```
 
 ---
 
-## 🔧 配置项详解
+## 配置项详解
 
 ### language - 插件语言
 
@@ -82,12 +88,20 @@ custom-commands:
 
 **类型：** `String`
 
-**内置可选值：**
+**内置语言：**
 
 | 值 | 语言 |
 |----|------|
 | `zh_CN` | 简体中文（默认）|
 | `en_US` | English |
+
+你也可以自行添加语言文件，例如：
+
+```text
+plugins/KaMenu/lang/de_DE.yml -> language: 'de_DE'
+```
+
+语言 ID 只能使用英文、数字、`_`、`-`，并且必须对应 `lang` 目录下的 `.yml` 文件名。
 
 **示例：**
 
@@ -139,6 +153,44 @@ bungeecord: false
 - 如果是单服务器或使用其他跨服方案，设置为 `false` 即可
 - 启用 BungeeCord 模式后，`server:` 动作会自动使用插件消息系统
 {% endhint %}
+
+---
+
+### input-capture - 输入捕获配置
+
+控制玩家提交输入组件后，KaMenu 写入 `$(输入键名)` 前的全局处理行为。
+
+```yaml
+input-capture:
+  trim-edge-spaces: false
+  remove-char-lists:
+    global:
+      - '&'
+      - '_'
+      - '\s'
+      - '\n'
+```
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `trim-edge-spaces` | `Boolean` | `false` | 是否移除所有文本输入框内容前后的空格 |
+| `remove-char-lists` | `Node` | 见默认配置 | 定义可被 `Inputs.*.remove_chars` 引用的命名字符移除列表 |
+
+开启后，玩家在文本输入框中输入 ` Steve `，动作、条件和 JavaScript 中读取 `$(player_name)` 时会得到 `Steve`。
+
+该配置只处理前后空格，不会移除中间空格。若需要删除指定字符，请在具体 `Inputs` 文本输入框中配置 `remove_chars`。
+
+`remove-char-lists` 用于集中维护常用过滤规则。菜单内可以直接引用预设名：
+
+```yaml
+Inputs:
+  command_arg:
+    type: 'input'
+    text: '&a请输入参数'
+    remove_chars: global
+```
+
+如果 `remove_chars` 的字符串值匹配某个全局预设名，KaMenu 会使用该预设；如果没有匹配到预设名，则继续按旧规则将该字符串作为需要移除的字符集合处理。
 
 ---
 
@@ -210,7 +262,9 @@ listeners:
 
 #### item-lore - 右键物品 Lore 触发
 
-玩家右键持有指定材质且包含特定 Lore 文本的物品时触发打开菜单。
+玩家右键持有指定材质的物品时触发打开菜单，并可选择额外匹配 Lore 文本。
+
+这是保留兼容的基础监听格式。需要匹配物品名称、损伤值、自定义模型 ID、设置毫秒冷却，或保存 TrMenu 迁移结果时，请使用独立的 [item_bindings.yml](item-bindings.md)。
 
 **配置格式：**
 
@@ -220,7 +274,7 @@ listeners:
     配置名称:        # 自定义名称，用于区分不同配置
       enabled: true  # 是否启用此配置
       material: 'CLOCK'              # 物品材质（必须匹配）
-      target-lore: '菜单'            # 目标 Lore 文本
+      target-lore: '菜单'            # 可选；目标 Lore 文本
       menu: 'main_menu'              # 触发时打开的菜单 ID
       require-sneaking: false        # 是否需要潜行才触发
 ```
@@ -229,9 +283,9 @@ listeners:
 
 | 字段 | 说明 | 类型 | 默认值 |
 |------|------|------|--------|
-| `enabled` | 是否启用此监听配置 | `Boolean` | `true` |
+| `enabled` | 是否启用此监听配置 | `Boolean` | `false` |
 | `material` | 物品材质（Material 枚举值，必须匹配） | `String` | 无 |
-| `target-lore` | 物品 Lore 中包含的文本（包含即匹配） | `String` | 无 |
+| `target-lore` | 可选的 Lore 包含文本；缺失、`''` 或 `[]` 时只匹配材质 | `String` / `[]` | 无 |
 | `menu` | 触发时打开的菜单 ID | `String` | 无 |
 | `require-sneaking` | 是否需要同时按住潜行键（Shift）才触发 | `Boolean` | `false` |
 
@@ -244,6 +298,19 @@ listeners:
       enabled: true
       material: 'CLOCK'
       target-lore: '服务器菜单'
+      menu: 'server_menu'
+      require-sneaking: false
+```
+
+如果只需要判断玩家手持物品的材质，可以将 `target-lore` 留空、设为空列表，或直接省略该字段：
+
+```yaml
+listeners:
+  item-lore:
+    material-only:
+      enabled: true
+      material: 'CLOCK'
+      target-lore: []
       menu: 'server_menu'
       require-sneaking: false
 ```
@@ -286,13 +353,14 @@ listeners:
 
 {% hint style="info" %}
 - 支持配置多个 item-lore 监听器，每个监听器可以设置不同的物品和菜单
-- `target-lore` 是模糊匹配，只要物品 Lore 中包含该文本就会触发
+- 非空的 `target-lore` 使用模糊匹配，只要物品 Lore 中包含该文本就会触发
+- `target-lore` 缺失、设为 `''` 或 `[]` 时不检查 Lore，只检查 `material`
 - 推荐为功能物品设置独特的 Lore 文本，避免与其他物品冲突
 {% endhint %}
 
 {% hint style="warning" %}
 **注意事项：**
-- 物品 Lore 的颜色代码会被忽略进行匹配（原始文本匹配）
+- 旧监听器按原始文本进行包含匹配，不会自动移除颜色，也不会把配置中的 `&` 转换为实际颜色代码
 - 确保物品 Lore 文本足够独特，避免误触发
 {% endhint %}
 
@@ -306,7 +374,7 @@ listeners:
 listeners:
   player-click:
     enabled: false              # 是否启用此监听
-    menu: 'inspect_player'      # 触发时打开的菜单 ID
+    menu: 'example/inspect_player'      # 触发时打开的菜单 ID
     require-sneaking: false      # 是否需要潜行时才触发
 ```
 
@@ -324,7 +392,7 @@ listeners:
 listeners:
   player-click:
     enabled: true
-    menu: 'inspect_player'
+    menu: 'example/inspect_player'
     require-sneaking: false
 ```
 
@@ -334,7 +402,7 @@ listeners:
 listeners:
   player-click:
     enabled: true
-    menu: 'inspect_player'
+    menu: 'example/inspect_player'
     require-sneaking: true   # 只有 Shift + 右键才触发
 ```
 
@@ -353,10 +421,10 @@ listeners:
 listeners:
   player-click:
     enabled: true
-    menu: 'inspect_player'
+    menu: 'example/inspect_player'
     require-sneaking: false
 
-# menus/inspect_player.yml
+# menus/example/inspect_player.yml
 Body:
   helmet:
     type: 'item'
@@ -392,18 +460,8 @@ Body:
 
 ---
 
-### custom-commands - 自定义指令
+### custom_commands.yml - 自定义指令
 
-将简短的自定义指令注册为打开指定菜单的快捷方式，无需额外权限配置。
+自定义指令已从 `config.yml` 独立到插件根目录的 `custom_commands.yml`。该文件仍使用 `custom-commands` 根节，可注册菜单快捷指令、actions 动作队列和 Tab 补全。
 
-**格式：** `指令名: 菜单ID`
-
-**示例：**
-
-```yaml
-custom-commands:
-  shop: 'server_shop'       # /shop -> 打开 server_shop 菜单
-  menu: 'main_menu'         # /menu -> 打开 main_menu 菜单
-  hub: 'hub/main'           # /hub  -> 打开 hub/main 菜单（子文件夹）
-```
-想要了解自定义指令的用法和优势，点击此处 [⌨️ 自定义指令](customCommands.md)
+详细字段、动作参数和迁移说明请参阅 [自定义指令](customCommands.md)。修改后使用 `/km reload config` 立即重载。

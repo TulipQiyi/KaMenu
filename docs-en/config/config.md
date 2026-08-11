@@ -1,10 +1,10 @@
-# ⛳ Configuration File: config.yml
+# Configuration File: config.yml
 
 `config.yml` is the global configuration file for KaMenu, located at `plugins/KaMenu/config.yml`.
 
 ---
 
-## 📋 Full Example
+## Full Example
 
 ```yaml
 # KaMenu global configuration file
@@ -14,6 +14,18 @@ language: 'zh_CN'
 
 # BungeeCord support (for the server: action)
 bungeecord: true
+
+# Input capture configuration
+input-capture:
+  # Whether to trim leading/trailing spaces before actions and conditions read $(input_key)
+  trim-edge-spaces: false
+  # Global character removal lists referenced by Inputs.*.remove_chars
+  remove-char-lists:
+    global:
+      - '&'
+      - '_'
+      - '\s'
+      - '\n'
 
 # Database configuration
 storage:
@@ -31,7 +43,7 @@ listeners:
   swap-hand:
     enabled: true
     # Menu to open on trigger
-    menu: 'main_menu'
+    menu: 'example/main_menu'
     # Whether sneaking is required to trigger
     require-sneaking: true
 
@@ -40,7 +52,7 @@ listeners:
     # Enable this listener
     enabled: true
     # Menu to open on trigger
-    menu: 'inspect_player'
+    menu: 'example/inspect_player'
     # Requires sneaking to trigger (Shift + right-click)
     require-sneaking: true 
     
@@ -53,7 +65,7 @@ listeners:
       # Target Lore text (triggers if item Lore contains this text)
       target-lore: 'Menu'
       # Menu to open on trigger
-      menu: 'main_menu'
+      menu: 'example/main_menu'
       # Whether sneaking is required to trigger
       require-sneaking: false
     # You can add more entries...
@@ -64,17 +76,11 @@ listeners:
     #   menu: 'server_shop'
     #   require-sneaking: false
 
-# Custom command registration
-# Format: command_name: menu_id
-custom-commands:
-  zcd: 'main_menu'
-  shop: 'server_shop'
-  menu: 'main_menu'
 ```
 
 ---
 
-## 🔧 Configuration Reference
+## Configuration Reference
 
 ### language — Plugin Language
 
@@ -82,12 +88,20 @@ Sets the display language of the plugin. Corresponds to a filename (without `.ym
 
 **Type:** `String`
 
-**Built-in Options:**
+**Built-in Languages:**
 
 | Value | Language |
 |-------|---------|
 | `zh_CN` | Simplified Chinese (default) |
 | `en_US` | English |
+
+You may also add your own language file, for example:
+
+```text
+plugins/KaMenu/lang/de_DE.yml -> language: 'de_DE'
+```
+
+Language IDs may only use letters, numbers, `_`, and `-`, and must match a `.yml` filename under the `lang` folder.
 
 **Example:**
 
@@ -139,6 +153,44 @@ Suitable for single-server setups or when using another cross-server solution.
 - If you are running a standalone server or using another cross-server solution, `false` is fine
 - When BungeeCord mode is enabled, the `server:` action automatically uses the plugin messaging system
 {% endhint %}
+
+---
+
+### input-capture — Input Capture Configuration
+
+Controls global processing before KaMenu writes submitted text input values into `$(input_key)`.
+
+```yaml
+input-capture:
+  trim-edge-spaces: false
+  remove-char-lists:
+    global:
+      - '&'
+      - '_'
+      - '\s'
+      - '\n'
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `trim-edge-spaces` | `Boolean` | `false` | Whether to trim leading and trailing spaces from all text input values |
+| `remove-char-lists` | `Node` | See default config | Named character removal lists that can be referenced by `Inputs.*.remove_chars` |
+
+When enabled, if a player enters ` Steve ` in a text field, actions, conditions, and JavaScript reading `$(player_name)` receive `Steve`.
+
+This only removes leading and trailing spaces, not spaces in the middle. To remove specific characters, configure `remove_chars` on a specific `Inputs` text field.
+
+`remove-char-lists` centralizes commonly used filtering rules. Menus can reference a preset by name:
+
+```yaml
+Inputs:
+  command_arg:
+    type: 'input'
+    text: '&aEnter argument'
+    remove_chars: global
+```
+
+If the string value of `remove_chars` matches a global preset name, KaMenu uses that preset. If it does not match a preset, the value keeps the legacy behavior and is treated as the literal set of characters to remove.
 
 ---
 
@@ -210,7 +262,9 @@ Enabling `require-sneaking` prevents the menu from opening accidentally during n
 
 #### item-lore — Right-Click Item with Lore Trigger
 
-Opens a menu when the player right-clicks while holding an item of a specified material that contains specific Lore text.
+Opens a menu when the player right-clicks while holding an item of a specified material, with optional Lore text matching.
+
+This is the legacy basic listener format. Use the separate [item_bindings.yml](item-bindings.md) when matching names, damage values, CustomModelData, applying millisecond cooldowns, or storing migrated TrMenu bindings.
 
 **Configuration Format:**
 
@@ -220,7 +274,7 @@ listeners:
     config_name:           # Custom name to differentiate entries
       enabled: true        # Whether to enable this entry
       material: 'CLOCK'              # Item material (must match)
-      target-lore: 'Menu'            # Target Lore text
+      target-lore: 'Menu'            # Optional target Lore text
       menu: 'main_menu'              # Menu ID to open on trigger
       require-sneaking: false        # Whether sneaking is required
 ```
@@ -229,9 +283,9 @@ listeners:
 
 | Field | Description | Type | Default |
 |-------|-------------|------|---------|
-| `enabled` | Whether to enable this listener entry | `Boolean` | `true` |
+| `enabled` | Whether to enable this listener entry | `Boolean` | `false` |
 | `material` | Item material (Material enum value, must match) | `String` | — |
-| `target-lore` | Text that must be present in item Lore (partial match) | `String` | — |
+| `target-lore` | Optional Lore text filter; omit it or use `''` / `[]` to match material only | `String` / `[]` | — |
 | `menu` | Menu ID to open on trigger | `String` | — |
 | `require-sneaking` | Whether the player must hold Sneak (Shift) to trigger | `Boolean` | `false` |
 
@@ -244,6 +298,19 @@ listeners:
       enabled: true
       material: 'CLOCK'
       target-lore: 'Server Menu'
+      menu: 'server_menu'
+      require-sneaking: false
+```
+
+To match only the held item material, leave `target-lore` empty, use an empty list, or omit the field:
+
+```yaml
+listeners:
+  item-lore:
+    material-only:
+      enabled: true
+      material: 'CLOCK'
+      target-lore: []
       menu: 'server_menu'
       require-sneaking: false
 ```
@@ -286,13 +353,14 @@ listeners:
 
 {% hint style="info" %}
 - Multiple item-lore listeners are supported, each with different items and menus
-- `target-lore` is a partial match — triggers as long as the item Lore contains the text
+- A non-empty `target-lore` uses partial matching and triggers when any Lore line contains the text
+- An omitted `target-lore`, `''`, or `[]` disables Lore matching and checks only `material`
 - Use unique Lore text for functional items to avoid conflicts with other items
 {% endhint %}
 
 {% hint style="warning" %}
 **Notes:**
-- Color codes in item Lore are stripped during matching (raw text match)
+- The legacy listener uses raw substring matching. It neither strips item colors nor converts configured `&` codes to actual color codes
 - Ensure Lore text is unique enough to prevent unintended triggers
 {% endhint %}
 
@@ -306,7 +374,7 @@ Opens a menu when a player right-clicks another player. Supports both plain righ
 listeners:
   player-click:
     enabled: false              # Whether to enable this listener
-    menu: 'inspect_player'      # Menu ID to open on trigger
+    menu: 'example/inspect_player'      # Menu ID to open on trigger
     require-sneaking: false     # Whether sneaking is required to trigger
 ```
 
@@ -324,7 +392,7 @@ listeners:
 listeners:
   player-click:
     enabled: true
-    menu: 'inspect_player'
+    menu: 'example/inspect_player'
     require-sneaking: false
 ```
 
@@ -334,7 +402,7 @@ listeners:
 listeners:
   player-click:
     enabled: true
-    menu: 'inspect_player'
+    menu: 'example/inspect_player'
     require-sneaking: true   # Only triggers on Shift + right-click
 ```
 
@@ -353,10 +421,10 @@ When the `player-click` listener triggers, the system automatically sets a meta 
 listeners:
   player-click:
     enabled: true
-    menu: 'inspect_player'
+    menu: 'example/inspect_player'
     require-sneaking: false
 
-# menus/inspect_player.yml
+# menus/example/inspect_player.yml
 Body:
   helmet:
     type: 'item'
@@ -392,19 +460,8 @@ Body:
 
 ---
 
-### custom-commands — Custom Commands
+### custom_commands.yml — Custom Commands
 
-Registers short custom commands as shortcuts to open specified menus, without any additional permission configuration.
+Custom commands are stored separately from `config.yml` in the plugin root file `custom_commands.yml`. The file keeps the `custom-commands` root section and supports menu shortcuts, action queues, and Tab completion.
 
-**Format:** `command_name: menu_id`
-
-**Example:**
-
-```yaml
-custom-commands:
-  shop: 'server_shop'       # /shop -> opens server_shop menu
-  menu: 'main_menu'         # /menu -> opens main_menu menu
-  hub: 'hub/main'           # /hub  -> opens hub/main menu (subdirectory)
-```
-
-To learn more about custom commands and their advantages, see [⌨️ Custom Commands](customCommands.md)
+See [Custom Commands](customCommands.md) for fields, action parameters, and migration details. Run `/km reload config` after editing to apply changes immediately.

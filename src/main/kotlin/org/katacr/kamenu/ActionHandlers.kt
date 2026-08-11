@@ -5,18 +5,20 @@ package org.katacr.kamenu
 import com.google.common.io.ByteStreams
 import net.kyori.adventure.text.Component
 import net.kyori.adventure.text.serializer.gson.GsonComponentSerializer
-import net.kyori.adventure.title.Title
 import net.milkbowl.vault.economy.Economy
 import org.bukkit.Bukkit
 import org.bukkit.NamespacedKey
 import org.bukkit.SoundCategory
 import org.bukkit.entity.Player
 import com.google.common.io.ByteArrayDataOutput
-import java.time.Duration
 
 /**
- * 动作处理器
- * 负责解析并执行各类具体动作（sound, title, toast, money, stock-item, item, server 等）
+ * 具体动作处理工具。
+ *
+ * [MenuActions] 负责动作序列和生命周期，本对象只处理某一类动作的参数解析与落地执行，
+ * 例如 sound、title、toast、money、stock-item、item、server、data/list 参数等。
+ *
+ * 新增动作时优先判断是否需要影响动作序列；若只是单个行为，通常应放在这里。
  */
 object ActionHandlers {
 
@@ -24,6 +26,7 @@ object ActionHandlers {
     private var databaseManager: DatabaseManager? = null
     private var metaDataManager: MetaDataManager? = null
     private var economy: Economy? = null
+    private var pointsService: PointsService? = null
     private var plugin: KaMenu? = null
     private var itemManager: ItemManager? = null
     private var bungeeCordEnabled: Boolean = false
@@ -50,6 +53,11 @@ object ActionHandlers {
         economy = econ
     }
 
+    /** 注入可选的 PlayerPoints 点券服务。 */
+    internal fun setPointsService(service: PointsService?) {
+        pointsService = service
+    }
+
     fun setItemManager(manager: ItemManager) {
         itemManager = manager
     }
@@ -61,14 +69,16 @@ object ActionHandlers {
     // ==================== 变量解析 ====================
 
     /**
-     * 解析变量（完整顺序：$(var) -> {data:var} -> %papi_var%）
+     * 解析带输入变量的文本。
+     *
+     * 兼容旧入口，实际委托给 [TextResolver]。
      */
     fun resolveVariablesWithInput(player: Player, text: String, variables: Map<String, String> = emptyMap()): String {
         return TextResolver.resolve(player, text, variables)
     }
 
     /**
-     * 解析变量（内置变量 + PAPI）
+     * 解析普通动作文本中的内置变量和 PAPI。
      */
     fun resolveVariables(player: Player, text: String): String {
         return resolveVariablesWithInput(player, text, emptyMap())
@@ -77,7 +87,9 @@ object ActionHandlers {
     // ==================== 具体动作处理器 ====================
 
     /**
-     * 解析并播放声音
+     * 解析并播放声音。
+     *
+     * 参数格式：`sound_name;volume=1.0;pitch=1.0;category=master`。
      */
     fun parseAndPlaySound(player: Player, args: String) {
         var soundName = ""
@@ -106,7 +118,8 @@ object ActionHandlers {
                             "player" -> SoundCategory.PLAYERS
                             "ambient" -> SoundCategory.AMBIENT
                             "voice" -> SoundCategory.VOICE
-                            "ui" -> SoundCategory.UI
+                            "ui" -> runCatching { SoundCategory.valueOf("UI") }
+                                .getOrDefault(SoundCategory.MASTER)
                             else -> {
                                 player.sendMessage(languageManager?.getMessage("actions.unknown_sound_category", cat) ?: "§c未知的声音类别: $cat")
                                 SoundCategory.MASTER
@@ -121,16 +134,24 @@ object ActionHandlers {
         }
 
         if (soundName.isNotEmpty()) {
-            val soundKey = NamespacedKey.minecraft(soundName.lowercase())
-            val sound = org.bukkit.Registry.SOUND_EVENT.get(soundKey)
+            val normalizedSoundName = soundName.lowercase()
+            val sound = runCatching {
+                org.bukkit.Sound.valueOf(soundName.uppercase())
+            }.getOrNull()
+
             if (sound != null) {
                 player.playSound(player.location, sound, category, volume, pitch)
+            } else {
+                // NamespacedKey 和资源包声音直接交给客户端解析，避免依赖不同版本的声音 Registry 字段。
+                player.playSound(player.location, normalizedSoundName, category, volume, pitch)
             }
         }
     }
 
     /**
-     * 解析并发送标题
+     * 解析并发送标题。
+     *
+     * 参数格式：`title=主标题;subtitle=副标题;in=10;keep=60;out=20`，时间单位为 tick。
      */
     fun parseAndSendTitle(player: Player, args: String) {
         var title = ""
@@ -158,14 +179,7 @@ object ActionHandlers {
         val titleComponent = if (title.isEmpty()) Component.empty() else TextParser.parseText(title)
         val subtitleComponent = if (subtitle.isEmpty()) Component.empty() else TextParser.parseText(subtitle)
 
-        // 使用 Adventure API 的 Title (Paper 推荐方式)
-        val titleTimes = Title.Times.times(
-            Duration.ofMillis(fadeIn * 50L),   // ticks to milliseconds
-            Duration.ofMillis(stay * 50L),     // ticks to milliseconds
-            Duration.ofMillis(fadeOut * 50L)   // ticks to milliseconds
-        )
-        val adventureTitle = Title.title(titleComponent, subtitleComponent, titleTimes)
-        player.showTitle(adventureTitle)
+        MenuUI.showTitle(player, titleComponent, subtitleComponent, fadeIn, stay, fadeOut)
     }
 
     /**
@@ -197,12 +211,13 @@ object ActionHandlers {
 
         val titleJson = GsonComponentSerializer.gson().serialize(TextParser.parseText(title))
         val descJson = GsonComponentSerializer.gson().serialize(TextParser.parseText(description))
+        val iconKey = if (Bukkit.getUnsafe().dataVersion >= 3837) "id" else "item"
 
         val advancementJson = """
     {
       "display": {
         "icon": {
-          "id": "${iconItem.lowercase()}"
+          "$iconKey": "${iconItem.lowercase()}"
         },
         "title": $titleJson,
         "description": $descJson,
@@ -224,14 +239,12 @@ object ActionHandlers {
             val progress = player.getAdvancementProgress(advancement)
             progress.awardCriteria("impossible")
 
-            plugin?.let {
-                Bukkit.getScheduler().runTaskLater(it, Runnable {
-                    if (player.isOnline) {
-                        progress.revokeCriteria("impossible")
-                        Bukkit.getUnsafe().removeAdvancement(randomKey)
-                    }
-                }, 10L)
-            }
+            KaScheduler.runPlayerLater(player, 10L, Runnable {
+                if (player.isOnline) {
+                    progress.revokeCriteria("impossible")
+                    Bukkit.getUnsafe().removeAdvancement(randomKey)
+                }
+            })
         } catch (e: Exception) {
             plugin?.logger?.warning("Toast 通知发送失败: ${e.message}")
         }
@@ -290,6 +303,85 @@ object ActionHandlers {
             else -> {
                 plugin?.logger?.warning("无效的金币操作类型: $type。玩家: ${player.name}")
             }
+        }
+    }
+
+    /**
+     * 解析并执行 PlayerPoints 点券增减动作。
+     *
+     * 标准格式为 `points: type=add|take;num=数量`；[forcedType] 用于兼容
+     * 源菜单 的 `add-points:`、`take-points:` 等单动作别名。
+     */
+    fun parseAndHandlePoints(
+        player: Player,
+        args: String,
+        variables: Map<String, String> = emptyMap(),
+        forcedType: String? = null
+    ) {
+        val service = pointsService
+        if (service == null) {
+            plugin?.logger?.warning(languageManager?.getMessage("actions.points_unavailable", player.name)
+                ?: "[KaMenu] PlayerPoints is not available. Player: ${player.name}")
+            return
+        }
+
+        var type = forcedType.orEmpty().lowercase()
+        var amountText = if (forcedType == null) "" else args.trim()
+        if (forcedType == null) {
+            args.split(";").forEach { parameter ->
+                val parts = parameter.split("=", limit = 2)
+                if (parts.size != 2) return@forEach
+                when (parts[0].trim().lowercase()) {
+                    "type" -> type = parts[1].trim().lowercase()
+                    "num", "amount" -> amountText = parts[1].trim()
+                }
+            }
+        }
+
+        val resolvedAmount = resolveVariablesWithInput(player, amountText, variables)
+        val amount = resolvedAmount.toIntOrNull()
+        if (amount == null || amount <= 0) {
+            plugin?.logger?.warning(languageManager?.getMessage(
+                "actions.points_invalid_amount",
+                resolvedAmount,
+                player.name
+            ) ?: "[KaMenu] Invalid PlayerPoints amount '$resolvedAmount'. Player: ${player.name}")
+            return
+        }
+
+        val normalizedType = when (type) {
+            "add", "give", "deposit" -> "add"
+            "take", "remove", "withdraw" -> "take"
+            else -> {
+                plugin?.logger?.warning(languageManager?.getMessage(
+                    "actions.points_invalid_type",
+                    type,
+                    player.name
+                ) ?: "[KaMenu] Invalid PlayerPoints operation '$type'. Player: ${player.name}")
+                return
+            }
+        }
+
+        if (normalizedType == "take" && service.balance(player.uniqueId) < amount) {
+            plugin?.logger?.warning(languageManager?.getMessage(
+                "actions.points_insufficient",
+                player.name,
+                amount.toString()
+            ) ?: "[KaMenu] Player ${player.name} does not have $amount points.")
+            return
+        }
+
+        val success = when (normalizedType) {
+            "add" -> service.add(player.uniqueId, amount)
+            else -> service.take(player.uniqueId, amount)
+        }
+        if (!success) {
+            plugin?.logger?.warning(languageManager?.getMessage(
+                "actions.points_operation_failed",
+                normalizedType,
+                amount.toString(),
+                player.name
+            ) ?: "[KaMenu] PlayerPoints operation failed: $normalizedType $amount. Player: ${player.name}")
         }
     }
 
@@ -374,6 +466,95 @@ object ActionHandlers {
     }
 
     /**
+     * 解析并执行 list/glist 动作。
+     *
+     * 列表以 JSON 字符串数组存储，读取变量时可直接作为 repeat source 使用。
+     */
+    fun parseAndExecuteListAction(
+        args: String,
+        player: Player,
+        dataType: String,
+        setAction: (String, List<String>) -> Unit,
+        addAction: (String, List<String>, Boolean) -> Unit,
+        removeAction: (String, List<String>) -> Unit,
+        clearAction: (String) -> Unit,
+        deleteAction: (String) -> Unit
+    ) {
+        var type = ""
+        var key = ""
+        var value = ""
+        var split = ""
+        var unique = true
+
+        args.split(";").forEach { param ->
+            val parts = param.split("=", limit = 2)
+            if (parts.size == 2) {
+                val paramKey = parts[0].trim().lowercase()
+                val paramValue = parts[1].trim().removeSurrounding("`").removeSurrounding("'").removeSurrounding("\"")
+                when (paramKey) {
+                    "type" -> type = paramValue.lowercase()
+                    "key" -> key = paramValue
+                    "var", "value" -> value = paramValue
+                    "split", "separator" -> split = paramValue
+                    "unique" -> unique = !(paramValue.equals("false", ignoreCase = true) || paramValue == "0" || paramValue.equals("no", ignoreCase = true))
+                }
+            }
+        }
+
+        if (key.isEmpty()) {
+            plugin?.logger?.warning("$dataType 操作失败: 缺少 key 参数。玩家: ${player.name}")
+            return
+        }
+
+        fun parseValues(): List<String> {
+            if (value.isEmpty()) return emptyList()
+            if (split.isNotEmpty()) {
+                val separator = when (split.lowercase()) {
+                    "\\n", "newline", "line" -> "\n"
+                    "\\t", "tab" -> "\t"
+                    else -> split
+                }
+                return value.split(separator).map { it.trim() }.filter { it.isNotEmpty() }
+            }
+            if (value.trim().startsWith("[") && value.trim().endsWith("]")) {
+                return DatabaseManager.decodeStringList(value)
+            }
+            return listOf(value)
+        }
+
+        when (type) {
+            "set", "create" -> {
+                setAction(key, parseValues())
+            }
+            "add", "append" -> {
+                val values = parseValues()
+                if (values.isEmpty()) {
+                    plugin?.logger?.warning("$dataType 操作失败: add 操作缺少 var 参数。玩家: ${player.name}")
+                } else {
+                    addAction(key, values, unique)
+                }
+            }
+            "remove", "take" -> {
+                val values = parseValues()
+                if (values.isEmpty()) {
+                    plugin?.logger?.warning("$dataType 操作失败: remove/take 操作缺少 var 参数。玩家: ${player.name}")
+                } else {
+                    removeAction(key, values)
+                }
+            }
+            "clear" -> {
+                clearAction(key)
+            }
+            "delete" -> {
+                deleteAction(key)
+            }
+            else -> {
+                plugin?.logger?.warning("$dataType 操作失败: 无效的 type 参数 '$type'，支持的类型: set, add, remove, take, clear, delete。玩家: ${player.name}")
+            }
+        }
+    }
+
+    /**
      * 解析并处理存储库物品给予/扣除动作
      */
     fun parseAndHandleStockItem(player: Player, args: String, variables: Map<String, String> = emptyMap()) {
@@ -418,7 +599,7 @@ object ActionHandlers {
         val item = itemManager!!.getItem(finalItemName)
         if (item == null) {
             languageManager?.getMessage("condition.stock_item_not_exist", finalItemName)?.let {
-                player.sendMessage(TextParser.parseText(it))
+                MenuUI.sendMessage(player, TextParser.parseText(it))
             }
             return
         }
@@ -441,7 +622,7 @@ object ActionHandlers {
                     // 发送 actionbar 提示和拾取音效
                     val actionbarMessage = languageManager?.getMessage("actions.inventory_full_actionbar", droppedAmount.toString())
                     if (actionbarMessage != null) {
-                        player.sendActionBar(TextParser.parseText(actionbarMessage))
+                        MenuUI.sendActionBar(player, TextParser.parseText(actionbarMessage))
                     }
                     player.playSound(player.location, org.bukkit.Sound.ENTITY_ITEM_PICKUP, 1.0f, 1.0f)
                 }
@@ -460,7 +641,7 @@ object ActionHandlers {
 
                 for (stack in allItems) {
                     if (remaining <= 0) break
-                    if (!stack.isEmpty && stack.isSimilar(item)) {
+                    if (stack.type != org.bukkit.Material.AIR && stack.amount > 0 && stack.isSimilar(item)) {
                         val stackAmount = stack.amount
                         if (stackAmount <= remaining) {
                             // 整个堆叠都扣除
@@ -550,9 +731,10 @@ object ActionHandlers {
             return
         }
 
-        // 获取材质（使用规范化的材质匹配）
+        // 外部物品保留插件写入的完整元数据；原版物品继续使用 Bukkit Material。
+        val externalItem = ExternalItemAdapter.create(finalMaterialName, amount, player)
         val material = MaterialUtils.matchMaterial(finalMaterialName)
-        if (material == null) {
+        if (externalItem == null && material == null) {
             languageManager?.getMessage("actions.item_invalid_material", finalMaterialName, player.name)?.let {
                 plugin?.logger?.warning(it)
             }
@@ -561,8 +743,9 @@ object ActionHandlers {
 
         when (type) {
             "give" -> {
-                // 给予物品（只需要材质和数量，忽略lore和model）
-                val itemToGive = org.bukkit.inventory.ItemStack(material, amount)
+                // 给予物品（只需要物品 ID 和数量，忽略 lore 和 model 过滤器）
+                val itemToGive = externalItem?.clone()
+                    ?: org.bukkit.inventory.ItemStack(material!!, amount)
                 val leftover = player.inventory.addItem(itemToGive)
 
                 if (leftover.isNotEmpty()) {
@@ -576,7 +759,7 @@ object ActionHandlers {
                     // 发送 actionbar 提示和拾取音效
                     val actionbarMessage = languageManager?.getMessage("actions.inventory_full_actionbar", droppedAmount.toString())
                     if (actionbarMessage != null) {
-                        player.sendActionBar(TextParser.parseText(actionbarMessage))
+                        MenuUI.sendActionBar(player, TextParser.parseText(actionbarMessage))
                     }
                     player.playSound(player.location, org.bukkit.Sound.ENTITY_ITEM_PICKUP, 1.0f, 1.0f)
                 }
@@ -595,17 +778,22 @@ object ActionHandlers {
 
                 for (stack in allItems) {
                     if (remaining <= 0) break
-                    if (!stack.isEmpty && stack.type == material) {
+                    val itemMatches = if (externalItem != null) {
+                        ExternalItemAdapter.matches(stack, finalMaterialName)
+                    } else {
+                        stack.type == material
+                    }
+                    if (stack.type != org.bukkit.Material.AIR && stack.amount > 0 && itemMatches) {
                         // 检查 lore 是否匹配（如果指定了 lore）
                         if (finalLoreText != null) {
                             val itemMeta = stack.itemMeta
                             if (itemMeta != null && itemMeta.hasLore()) {
-                                val lore = itemMeta.lore()
+                                val lore = MenuUI.itemLore(itemMeta)
                                 // 检查 lore 中是否包含指定字符串（忽略大小写）
-                                val loreMatched = lore?.any { line ->
+                                val loreMatched = lore.any { line ->
                                     val plainText = net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer.legacySection().serialize(line)
                                     plainText.contains(finalLoreText, ignoreCase = true)
-                                } ?: false
+                                }
                                 if (!loreMatched) {
                                     continue
                                 }
@@ -618,22 +806,8 @@ object ActionHandlers {
                         // 检查 item_model 是否匹配（如果指定了 model）
                         if (finalItemModel != null) {
                             val itemMeta = stack.itemMeta
-                            if (itemMeta != null && itemMeta.hasItemModel()) {
-                                val modelKey = itemMeta.itemModel
-                                if (modelKey != null) {
-                                    // 格式化为 namespace:key
-                                    val modelStr = "${modelKey.namespace()}:${modelKey.value()}"
-                                    if (!modelStr.equals(finalItemModel, ignoreCase = true)) {
-                                        continue
-                                    }
-                                } else {
-                                    // 没有模型，跳过
-                                    continue
-                                }
-                            } else {
-                                // 没有模型，跳过
-                                continue
-                            }
+                            val modelKey = ItemPropertyReader.getItemModel(itemMeta) ?: continue
+                            if (!modelKey.equals(finalItemModel, ignoreCase = true)) continue
                         }
 
                         // 符合所有条件，执行扣除
@@ -672,6 +846,6 @@ object ActionHandlers {
             if (parts.size <= 4) location.yaw = player.location.yaw
             if (parts.size <= 5) location.pitch = player.location.pitch
         }
-        player.teleport(location)
+        KaScheduler.teleport(player, location)
     }
 }

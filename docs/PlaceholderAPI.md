@@ -1,4 +1,4 @@
-# 🔖 PlaceholderAPI
+# PlaceholderAPI
 
 KaMenu 内置了 PlaceholderAPI (PAPI) 扩展，将插件内的数据暴露为可在其他插件（如记分板、聊天插件）中使用的占位符变量。
 
@@ -10,22 +10,31 @@ KaMenu 内置了 PlaceholderAPI (PAPI) 扩展，将插件内的数据暴露为�
 
 ---
 
-## 📊 变量类型一览表
+## 变量类型一览表
 
 | 变量类型 | 前缀 | 数据来源 | 持久化 | 说明 |
 |---------|-------|---------|---------|------|
 | **玩家数据** | `%kamenu_data_<键名>%` | 数据库 | ✅ 是 | 持久化存储的玩家个人数据 |
 | **全局数据** | `%kamenu_gdata_<键名>%` | 数据库 | ✅ 是 | 服务器级别的全局共享数据 |
+| **玩家列表** | `%kamenu_list_<键名>%` | 数据库 | ✅ 是 | 当前玩家的持久化字符串列表，返回 JSON 数组 |
+| **全局列表** | `%kamenu_glist_<键名>%` | 数据库 | ✅ 是 | 全局共享字符串列表，返回 JSON 数组 |
+| **玩家列表长度** | `%kamenu_list_size_<键名>%` | 数据库 | ✅ 是 | 当前玩家列表项目数量 |
+| **全局列表长度** | `%kamenu_glist_size_<键名>%` | 数据库 | ✅ 是 | 全局列表项目数量 |
+| **在线玩家列表** | `%kamenu_online_players%` | 在线玩家 | ❌ 否 | 当前在线玩家名称列表，返回 JSON 数组 |
 | **玩家元数据** | `%kamenu_meta_<键名>%` | 内存 | ❌ 否 | 临时缓存的玩家数据 |
+| **物品属性** | `%kamenu_checkitem_[来源;属性]%` | 玩家背包 / 内存 | ❌ 否 | 读取主手、副手、槽位或保存物品的常用属性 |
 | **背包物品** | `%kamenu_hasitem_[物品属性]%` | 玩家背包 | - | 查询玩家背包中符合条件的物品数量 |
 | **存储库物品** | `%kamenu_hasstockitem_<物品名>%` | 玩家背包 | - | 查询玩家背包中指定存储库物品的数量 |
 
 **快速导航：**
-- 📦 [玩家数据变量](#玩家数据变量)
-- 🌐 [全局数据变量](#全局数据变量)
-- 💾 [玩家元数据变量](#玩家元数据变量)
-- 🎒 [背包物品变量](#背包物品变量)
-- 📦 [存储库物品变量](#存储库物品变量)
+- [玩家数据变量](#玩家数据变量)
+- [全局数据变量](#全局数据变量)
+- [列表变量](#列表变量)
+- [在线玩家列表变量](#在线玩家列表变量)
+- [玩家元数据变量](#玩家元数据变量)
+- [物品属性变量](#物品属性变量)
+- [背包物品变量](#背包物品变量)
+- [存储库物品变量](#存储库物品变量)
 
 ---
 
@@ -33,7 +42,7 @@ KaMenu 内置了 PlaceholderAPI (PAPI) 扩展，将插件内的数据暴露为�
 
 ### 玩家数据变量
 
-读取特定玩家的个人持久化数据（由 `set-data` 动作写入）。
+读取特定玩家的个人持久化数据（可由 `set-data` 简写动作或 `data:` 参数动作写入）。
 
 **格式：** `%kamenu_data_<键名>%`
 
@@ -58,7 +67,7 @@ scoreboard:
 
 ### 全局数据变量
 
-读取服务器级别的全局共享数据（由 `set-gdata` 动作写入）。
+读取服务器级别的全局共享数据（可由 `set-gdata` 简写动作或 `gdata:` 参数动作写入）。
 
 **格式：** `%kamenu_gdata_<键名>%`
 
@@ -80,9 +89,80 @@ announcements:
 
 ---
 
+### 列表变量
+
+读取 KaMenu 内置列表数据，返回 JSON 字符串数组。适合作为动态按钮 `repeat.source` 或 `inList` / `inGlist` 条件的列表参数。
+
+**格式：**
+
+- `%kamenu_list_<键名>%`：读取当前玩家列表
+- `%kamenu_glist_<键名>%`：读取全局列表
+
+**示例：**
+
+| 变量 | 说明 |
+|------|------|
+| `%kamenu_list_friends%` | 当前玩家的 `friends` 列表 |
+| `%kamenu_glist_servers%` | 全局 `servers` 列表 |
+| `%kamenu_list_size_friends%` | 当前玩家 `friends` 列表的项目数量 |
+| `%kamenu_glist_size_servers%` | 全局 `servers` 列表的项目数量 |
+
+```yaml
+Bottom:
+  type: multi
+  buttons:
+    friends:
+      type: repeat
+      source: "%kamenu_list_friends%"
+      item:
+        text: "&a{item.value}"
+```
+
+**用于条件判断：**
+
+```yaml
+condition: "%kamenu_list_size_friends% > 0"
+condition: "%kamenu_glist_size_servers% >= 3"
+```
+
+---
+
+### 在线玩家列表变量
+
+读取当前在线玩家名称列表，返回 JSON 字符串数组。
+
+**格式：** `%kamenu_online_players%`
+
+**示例返回值：**
+
+```json
+["Steve","Alex","Notch"]
+```
+
+**用于动态按钮：**
+
+```yaml
+Bottom:
+  type: multi
+  buttons:
+    online_players:
+      type: repeat
+      source: "%kamenu_online_players%"
+      item:
+        text: "&a{item.value}"
+```
+
+**用于条件判断：**
+
+```yaml
+condition: "inGlist.$(target);%kamenu_online_players%"
+```
+
+---
+
 ### 玩家元数据变量
 
-读取特定玩家的临时内存缓存数据（由 `set-meta` 动作写入）。
+读取特定玩家的临时内存缓存数据（可由 `set-meta` 简写动作或 `meta:` 参数动作写入）。
 
 **格式：** `%kamenu_meta_<键名>%`
 
@@ -111,11 +191,129 @@ scoreboard:
 
 ---
 
+### 物品属性变量
+
+KaMenu 可以读取物品的常用属性。菜单内部优先使用不依赖 PlaceholderAPI 的大括号变量；需要在其他插件中读取时使用 PAPI：
+
+```text
+{checkitem:[hand;name]}
+%kamenu_checkitem_[hand;name]%
+```
+
+两种写法的来源、属性和返回值完全相同。
+
+**参数结构：**
+
+```text
+{checkitem:[<物品位置>;<输出属性>;<可选格式>]}
+%kamenu_checkitem_[<物品位置>;<输出属性>;<可选格式>]%
+```
+
+`checkitem` 最多支持三个参数，参数之间使用英文分号 `;` 分隔：
+
+| 顺序 | 参数 | 必需 | 作用 |
+|------|------|------|------|
+| 第一个 | 物品位置/来源 | ✅ | 定位需要读取的物品，例如 `hand`、`offhand`、`slot:0`、`stock:神奇之剑` |
+| 第二个 | 输出属性 | ✅ | 指定需要返回的具体属性，例如 `name`、`lore:1`、`ench:sharpness`、`dura_pct` |
+| 第三个 | 文本格式 | ❌ | 使用 `fmt:plain`、`fmt:legacy` 或 `fmt:mini`；未填写时默认 `fmt:plain` |
+
+例如 `{checkitem:[slot:0;lore:1;fmt:mini]}` 可以拆解为：
+
+1. `slot:0`：定位玩家背包的 `0` 号槽位。
+2. `lore:1`：输出该物品第 `1` 行 Lore；Lore 行号从 `1` 开始。
+3. `fmt:mini`：将该行文本转换为 MiniMessage 格式。
+
+分号 `;` 用于分隔三个顶层参数，冒号 `:` 用于参数内部取值。因此 `slot:0`、`lore:1` 和 `fmt:mini` 都是一个完整参数。背包槽位从 `0` 开始，Lore 行号从 `1` 开始。
+
+**物品来源：**
+
+| 来源 | 说明 |
+|------|------|
+| `hand` | 当前玩家主手物品 |
+| `offhand` | 当前玩家副手物品 |
+| `slot:<索引>` | 玩家背包指定 Bukkit 槽位 |
+| `stock:<名称>` | KaMenu 保存物品库；直接读取内存缓存，不查询 SQL |
+| `itemsadder:<namespace:id>` / `ia:<namespace:id>` | ItemsAdder 物品模板 |
+| `oraxen:<id>` | Oraxen 物品模板 |
+| `craftengine:<namespace:id>` / `ce:<namespace:id>` | CraftEngine 物品模板 |
+
+**可读属性：**
+
+| 属性 | 返回值 |
+|------|--------|
+| `type` | 完整材质 ID，例如 `minecraft:diamond_sword` |
+| `custom_id` / `external_id` / `item_id` | 带 KaMenu 提供方前缀的规范外部物品 ID；原版物品返回空字符串 |
+| `plugin_id` / `native_id` | 插件自身的物品 ID，不含 KaMenu 提供方前缀 |
+| `plugin` / `provider` | `ItemsAdder`、`Oraxen` 或 `CraftEngine`；原版物品返回空字符串 |
+| `amt` | 堆叠数量 |
+| `name` | 物品有效显示名称 |
+| `lore` | Lore JSON 字符串数组 |
+| `lore:<行号>` | 指定 Lore 行，从 `1` 开始；`lore:1` 表示第一行 |
+| `enchants` | `[ {"key":"minecraft:sharpness","level":5} ]` 形式的 JSON 数组 |
+| `ench:<附魔ID>` | 指定附魔等级；不存在返回 `0` |
+| `model` / `item_model` | 物品模型 NamespacedKey |
+| `cmd` / `custom_model_data` / `custom_model_id` | 自定义模型 ID，默认按整数输出；不存在返回空字符串 |
+| `dmg` | 已损耗耐久 |
+| `dura` | 剩余耐久 |
+| `dura_pct` | 剩余耐久百分比 `0` 至 `100`，不带 `%` |
+
+名称和 Lore 默认返回纯文本。格式选项使用 `fmt:<格式>`，并作为第三个分号参数填写：
+
+| 格式选项 | 返回内容 |
+|----------|----------|
+| `fmt:plain` | 纯文本，默认值；移除颜色和事件 |
+| `fmt:legacy` | 保留为 `&` Legacy 颜色格式 |
+| `fmt:mini` | 转换为 MiniMessage 格式 |
+
+`fmt` 仅影响 `name`、`lore` 和 `lore:<行号>`；材质、模型、附魔和数字属性不受影响。
+
+以下每一行都是独立用法示例，请放入对应的菜单字段中；不要在同一个 YAML 节点内重复配置多个 `text` 键：
+
+```yaml
+# 输出玩家主手物品的有效显示名称；未指定 fmt，因此返回纯文本
+text: '&f主手：{checkitem:[hand;name]}'
+
+# 输出玩家主手物品的剩余耐久百分比；变量本身不包含百分号
+text: '&7耐久：{checkitem:[hand;dura_pct]}%'
+
+# 判断玩家主手物品的锋利附魔是否达到 5 级
+condition: '{checkitem:[hand;ench:sharpness]} >= 5'
+
+# 读取保存物品“神奇之剑”的全部附魔 JSON，可直接作为 repeat 数据源
+source: '{checkitem:[stock:神奇之剑;enchants]}'
+
+# 读取保存物品“神奇之剑”的第 1 行 Lore，并转换为 MiniMessage 格式
+text: '{checkitem:[stock:神奇之剑;lore:1;fmt:mini]}'
+
+# 同时输出主手物品的 ItemModel NamespacedKey 和整数 CustomModelData
+text: '模型：{checkitem:[hand;item_model]} / ID：{checkitem:[hand;custom_model_id]}'
+
+# 读取 ItemsAdder 模板名称，并检查玩家主手中的外部物品身份
+text: '{checkitem:[itemsadder:my_pack:magic_sword;name;fmt:mini]}'
+condition: '{checkitem:[hand;custom_id]} == itemsadder:my_pack:magic_sword'
+```
+
+原版附魔可省略 `minecraft:`，例如 `ench:sharpness`；自定义附魔必须填写完整命名空间，例如 `ench:myplugin:lifesteal`。
+
+保存物品名包含分号时，必须使用反引号包裹物品名，避免单引号或双引号与 YAML 字符串边界冲突：
+
+```yaml
+text: '{checkitem:[stock:`活动;长剑`;name]}'
+```
+
+外层 YAML 仍可使用单引号或双引号；内部物品名只使用反引号。单引号和双引号不会被 `checkitem` 当作参数包裹符。
+
+物品不存在时，字符串返回空字符串、数字返回 `0`、列表返回 `[]`。玩家背包和外部插件物品模板只能在 Paper 主线程或 Folia 当前玩家区域线程读取；异步第三方 PAPI 请求不会跨线程阻塞，此时返回空值。`stock:` 来源不受此限制。
+
+---
+
 ### 背包物品变量
 
-查询玩家背包中符合条件的普通物品数量（材质、描述、模型等）。
+查询玩家背包中符合条件的原版或外部插件物品数量（物品 ID、描述、模型等）。
 
-**格式：** `%kamenu_hasitem_[mats=材质;lore=描述;model=模型]%`
+**格式：** `%kamenu_hasitem_[mats=材质;lore=描述;model=物品模型;custom_model_id=整数ID]%`
+
+`mats` 支持原版材质，以及 `itemsadder:`/`ia:`、`oraxen:`、`craftengine:`/`ce:` 外部物品前缀。外部物品按插件物品 ID 精确匹配。
 
 **参数说明：**
 
@@ -123,7 +321,8 @@ scoreboard:
 |------|------|------|------|
 | `mats` | ✅ 是 | 物品材质类型 | `DIAMOND`, `GOLD_INGOT`, `IRON_INGOT` |
 | `lore` | ❌ 否 | 物品描述（支持模糊匹配） | `神器`, `锻造材料` |
-| `model` | ❌ 否 | 物品模型（namespace:key格式） | `minecraft:custom_item` |
+| `model` / `item_model` | ❌ 否 | ItemModel（namespace:key 格式） | `minecraft:custom_item` |
+| `cmd` / `custom_model_data` / `custom_model_id` | ❌ 否 | 整数 CustomModelData | `10001` |
 
 
 **示例：**
@@ -134,6 +333,7 @@ scoreboard:
 | `%kamenu_hasitem_[mats=GOLD_INGOT]%` | 返回背包中金锭的数量 |
 | `%kamenu_hasitem_[mats=DIAMOND;lore=神器]%` | 返回背包中带有"神器"描述的钻石数量 |
 | `%kamenu_hasitem_[mats=IRON_INGOT;lore=锻造材料;model=custom:iron]%` | 返回符合材质、描述和模型的铁锭数量 |
+| `%kamenu_hasitem_[mats=PAPER;custom_model_id=10001]%` | 返回自定义模型 ID 为 `10001` 的纸张数量 |
 
 **在菜单中使用：**
 
@@ -181,7 +381,7 @@ Bottom:
 
 1. 手持要保存的物品
 2. 执行 `/km item save <物品名称>` 指令
-3. 详细说明请查看：[📝 指令列表 - /km item](perm/commands.md#km-item)
+3. 详细说明请查看：[指令列表 - /km item](perm/commands.md#km-item)
 {% endhint %}
 
 **示例：**
@@ -394,8 +594,8 @@ Bottom:
 
 1. **PAPI 插件依赖**：需要安装 PlaceholderAPI 才能使用这些变量
 2. **数据持久化**：
-   - 使用 `set-data` 和 `set-gdata` 动作写入的数据会持久化保存
-   - 使用 `set-meta` 动作写入的数据仅存储在内存中，不持久化
+   - 使用 `set-data` / `data:` 和 `set-gdata` / `gdata:` 动作写入的数据会持久化保存
+   - 使用 `set-meta` / `meta:` 动作写入的数据仅存储在内存中，不持久化
 3. **键名区分**：玩家数据键、全局数据键和元数据键使用不同的前缀（`data_`、`gdata_` 和 `meta_`），存储位置和生命周期也不同
 4. **类型限制**：所有数据都以字符串形式存储，使用时需要根据需要进行类型转换
 5. **性能考虑**：频繁读取大量数据可能影响性能，建议合理使用
@@ -409,7 +609,7 @@ Bottom:
    - 插件重载或关服时清理全部元数据
    - 适用于需要短时间存储临时数据的场景
 8. **物品变量特性**：
-   - `hasitem` 变量支持多条件匹配（材质、lore、model）
+   - `hasitem` 变量支持多条件匹配（材质、lore、ItemModel、整数 CustomModelData）
    - `hasstockitem` 变量使用存储库物品进行精确匹配
    - 物品不存在时返回 `0`
    - 物品数量是实时计算的，包括所有匹配物品的总和

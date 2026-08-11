@@ -9,8 +9,12 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 
 /**
- * 配置文件更新管理器
- * 用于处理配置文件的版本升级、合并和备份
+ * 配置文件更新管理器。
+ *
+ * 当 `config-version` 落后于当前资源文件时，会备份旧配置、释放新版 config.yml，
+ * 再把用户已有的同名键写回新文件。这样能新增配置项，同时尽量保留用户设置。
+ *
+ * 注意：只迁移新版配置中仍存在的键；已废弃键不会写回。
  */
 object ConfigUpdater {
 
@@ -49,7 +53,7 @@ object ConfigUpdater {
      * 当前配置文件版本
      * 每次配置文件结构变更时需要增加此版本号
      */
-    private const val CURRENT_CONFIG_VERSION = 3
+    private const val CURRENT_CONFIG_VERSION = 6
 
     /**
      * 配置版本键名
@@ -59,6 +63,7 @@ object ConfigUpdater {
     /**
      * 检查并更新配置文件
      * 流程：记录用户配置 → 备份 → 覆盖新配置 → 写入用户值
+     *
      * @param plugin 插件实例
      * @param configFile 配置文件
      * @return 是否进行了更新
@@ -86,7 +91,7 @@ object ConfigUpdater {
         }
 
         // 5. 将用户自定义的值写入到新配置文件
-        writeUserValues(plugin, configFile, userConfigValues)
+        writeUserValues(plugin, configFile, userConfigValues, configVersion)
 
         plugin.logger.info(getMessage("config_update.update_success", configVersion.toString(), CURRENT_CONFIG_VERSION.toString()))
         return true
@@ -138,7 +143,7 @@ object ConfigUpdater {
      * @param configFile 配置文件
      * @param userValues 用户配置值
      */
-    private fun writeUserValues(plugin: JavaPlugin, configFile: File, userValues: Map<String, Any?>) {
+    private fun writeUserValues(plugin: JavaPlugin, configFile: File, userValues: Map<String, Any?>, oldConfigVersion: Int) {
         try {
             val config = YamlConfiguration.loadConfiguration(configFile)
 
@@ -151,7 +156,7 @@ object ConfigUpdater {
 
                 // 只写入新配置文件中存在的键（保留用户的自定义值）
                 if (config.contains(key)) {
-                    config.set(key, value)
+                    config.set(key, migrateValue(key, value, oldConfigVersion))
                     preservedCount++
                 }
             }
@@ -161,6 +166,18 @@ object ConfigUpdater {
         } catch (e: IOException) {
             plugin.logger.warning(getMessage("config_update.save_failed", e.message ?: "unknown error"))
         }
+    }
+
+    private fun migrateValue(key: String, value: Any?, oldConfigVersion: Int): Any? {
+        if (oldConfigVersion < 4) {
+            if (key == "listeners.player-click.menu" && value == "inspect_player") {
+                return "example/inspect_player"
+            }
+            if (key in listOf("listeners.swap-hand.menu", "listeners.item-lore.main-menu.menu") && value == "main_menu") {
+                return "example/main_menu"
+            }
+        }
+        return value
     }
 
     /**

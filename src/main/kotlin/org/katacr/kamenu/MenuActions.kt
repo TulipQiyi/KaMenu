@@ -2,7 +2,6 @@
 
 package org.katacr.kamenu
 
-import io.papermc.paper.registry.data.dialog.action.DialogAction
 import net.kyori.adventure.text.Component
 import net.kyori.adventure.text.event.ClickCallback
 import net.kyori.adventure.text.event.ClickEvent
@@ -14,11 +13,18 @@ import org.katacr.kamenu.api.KaMenuActionHandler
 import java.time.Duration
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * 菜单动作处理器
- * 负责解析和执行菜单中的各种动作
+ * 菜单动作执行中心。
+ *
+ * 负责把 YAML 中的动作节点解析为实际行为，支持普通字符串动作、条件 Map、
+ * 嵌套动作列表、动作包调用、目标选择器、概率/单行延迟修饰符、wait 延迟、return 中断和外部插件动作。
+ *
+ * 动作执行是“异步串行”的：每个节点按顺序执行，遇到 `wait:` 会返回一个 future，
+ * 后续动作会在等待完成后继续，因此变量和条件会在真正执行到该节点时才解析；
+ * `{wait: ...}` 则把当前行独立调度，不等待该行完成。
  */
 object MenuActions {
     private var languageManager: LanguageManager? = null
@@ -27,6 +33,7 @@ object MenuActions {
     private var economy: Economy? = null
     private var plugin: KaMenu? = null
     private var itemManager: ItemManager? = null
+    private var actionPackageManager: ActionPackageManager? = null
     private var bungeeCordEnabled: Boolean = false
     private val externalActionHandlers = ConcurrentHashMap<String, KaMenuActionHandler>()
 
@@ -38,11 +45,19 @@ object MenuActions {
         val targetSelector: String?
     )
 
-    private data class ParsedActionCall(
-        val name: String,
-        val arguments: List<String>
+    /** 单行动作中提取出的条件、概率与独立延迟修饰符。 */
+    private data class ActionModifiers(
+        val action: String,
+        val condition: String?,
+        val chance: String?,
+        val delay: String?
     )
 
+    /**
+     * 单次动作列表执行上下文。
+     *
+     * 这里集中保存玩家、变量、菜单配置和生命周期标记，避免在递归执行 wait/条件/actions 包时丢失上下文。
+     */
     private data class ActionExecutionContext(
         val player: Player,
         val variables: Map<String, String>,
@@ -50,7 +65,25 @@ object MenuActions {
         val config: YamlConfiguration?,
         val asyncDataOperations: Boolean,
         val taskRef: MenuTaskManager.TaskExecutionRef? = null,
+        val contextId: String? = null,
+        val actionListId: String? = null,
         val handledMenuLifecycle: AtomicBoolean = AtomicBoolean(false)
+    )
+
+    /**
+     * 已解析的动作包或菜单内动作组。
+     *
+     * id 用于阻止动作组直接调用自身，避免无限递归。
+     */
+    private data class ResolvedActionList(
+        val actions: List<Any>,
+        val id: String
+    )
+
+    /** `open` / `force-open` 动作解析出的目标菜单和传入参数。 */
+    private data class MenuOpenRequest(
+        val menuId: String,
+        val arguments: List<String>
     )
 
     /**
@@ -61,10 +94,10 @@ object MenuActions {
         SINGLE_TARGET_ONLY  // 只对单个玩家有意义的动作
     }
 
-    /**
-     * 预编译的目标选择器正则表达式（性能优化）
-     */
-    private val targetSelectorPattern = Regex("\\{player:\\s*([^}]*)\\}", RegexOption.IGNORE_CASE)
+    private val pointsAliasPattern = Regex(
+        """^(give|add|deposit|take|remove|withdraw)-?points?\s*:\s*(.*)$""",
+        RegexOption.IGNORE_CASE
+    )
 
     /**
      * 设置语言管理器引用
@@ -78,6 +111,10 @@ object MenuActions {
      */
     fun setDatabaseManager(manager: DatabaseManager) {
         databaseManager = manager
+    }
+
+    fun setActionPackageManager(manager: ActionPackageManager) {
+        actionPackageManager = manager
     }
 
     /**
@@ -122,15 +159,34 @@ object MenuActions {
      * @return ParsedAction 包含动作和目标选择器
      */
     private fun parseTargetSelector(action: String): ParsedAction {
-        val match = targetSelectorPattern.find(action)
-
-        return if (match != null) {
-            val selector = match.groupValues[1].trim()
-            val actionWithoutSelector = action.replace(match.value, "")
-            ParsedAction(actionWithoutSelector, selector)
-        } else {
-            ParsedAction(action, null)
+        val lower = action.lowercase()
+        val start = lower.lastIndexOf("{player:")
+        if (start < 0) {
+            return ParsedAction(action, null)
         }
+
+        var depth = 0
+        var end = -1
+        for (index in start until action.length) {
+            when (action[index]) {
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) {
+                        end = index
+                        break
+                    }
+                }
+            }
+        }
+
+        if (end < 0) {
+            return ParsedAction(action, null)
+        }
+
+        val selector = action.substring(start + "{player:".length, end).trim()
+        val actionWithoutSelector = action.removeRange(start, end + 1).trimEnd()
+        return ParsedAction(actionWithoutSelector, selector)
     }
 
     /**
@@ -143,19 +199,30 @@ object MenuActions {
 
         return when {
             // 只对单个玩家有意义的动作
-            trimmedAction.startsWith("close:") -> ActionType.SINGLE_TARGET_ONLY
-            trimmedAction.startsWith("open:") -> ActionType.SINGLE_TARGET_ONLY
             trimmedAction.startsWith("server:") -> ActionType.SINGLE_TARGET_ONLY
             trimmedAction.startsWith("actions:") -> ActionType.SINGLE_TARGET_ONLY
             trimmedAction.startsWith("run-task:") -> ActionType.SINGLE_TARGET_ONLY
             trimmedAction.startsWith("stop-task:") -> ActionType.SINGLE_TARGET_ONLY
             trimmedAction.startsWith("stop-current-task") -> ActionType.SINGLE_TARGET_ONLY
+            trimmedAction.startsWith("page:") -> ActionType.SINGLE_TARGET_ONLY
+            trimmedAction.startsWith("set-args:") -> ActionType.SINGLE_TARGET_ONLY
+            trimmedAction.startsWith("del-args") -> ActionType.SINGLE_TARGET_ONLY
             trimmedAction.startsWith("wait:") -> ActionType.SINGLE_TARGET_ONLY
             trimmedAction.startsWith("return") -> ActionType.SINGLE_TARGET_ONLY
 
             // 支持多目标的动作
             else -> ActionType.MULTITARGET
         }
+    }
+
+    /** 将 源菜单 风格的点券动作名转换为 KaMenu 的 add/take 操作。 */
+    private fun parsePointsAlias(action: String): Pair<String, String>? {
+        val match = pointsAliasPattern.matchEntire(action.trim()) ?: return null
+        val type = when (match.groupValues[1].lowercase()) {
+            "give", "add", "deposit" -> "add"
+            else -> "take"
+        }
+        return type to match.groupValues[2].trim()
     }
 
     /**
@@ -195,6 +262,12 @@ object MenuActions {
         }
     }
 
+    /**
+     * 注册外部动作命名空间。
+     *
+     * 外部动作会在内置动作前尝试执行，适合其他插件扩展 `namespace:payload`。
+     * namespace 只能是冒号前缀，不包含冒号本身。
+     */
     fun registerExternalActionHandler(namespace: String, handler: KaMenuActionHandler): Boolean {
         val normalized = namespace.trim().lowercase()
         if (normalized.isEmpty() || normalized.contains(":")) {
@@ -204,6 +277,9 @@ object MenuActions {
         return true
     }
 
+    /**
+     * 注销外部动作命名空间。
+     */
     fun unregisterExternalActionHandler(namespace: String) {
         val normalized = namespace.trim().lowercase()
         if (normalized.isNotEmpty()) {
@@ -237,13 +313,6 @@ object MenuActions {
 
 
     /**
-     * 解析变量（完整顺序：$(var) -> {data:var} -> %papi_var%）
-     * @param player 玩家对象
-     * @param text 原始文本
-     * @param variables 输入变量映射（$(var)）
-     * @return 解析后的文本
-     */
-    /**
      * 解析变量（内置变量 + PAPI）
      * @param player 玩家对象
      * @param text 原始文本
@@ -253,62 +322,55 @@ object MenuActions {
         return ActionHandlers.resolveVariables(player, text)
     }
 
-    private fun parseActionCall(raw: String): ParsedActionCall {
-        val parts = splitActionCallArguments(raw)
-        val name = parts.firstOrNull()?.trim().orEmpty()
-        val args = if (parts.size > 1) parts.drop(1).map { stripArgumentQuotes(it.trim()) } else emptyList()
-        return ParsedActionCall(name, args)
+    private fun parseActionCall(raw: String): ActionArgumentParser.Call {
+        return ActionArgumentParser.parseCall(raw)
     }
 
-    private fun splitActionCallArguments(raw: String): List<String> {
-        val result = mutableListOf<String>()
-        val current = StringBuilder()
-        var quote: Char? = null
-        var escaping = false
-
-        for (ch in raw) {
-            if (escaping) {
-                current.append(ch)
-                escaping = false
-                continue
-            }
-
-            if (ch == '\\') {
-                escaping = true
-                continue
-            }
-
-            if (quote != null) {
-                if (ch == quote) {
-                    quote = null
-                } else {
-                    current.append(ch)
-                }
-                continue
-            }
-
-            when (ch) {
-                '\'', '"', '`' -> quote = ch
-                ',' -> {
-                    result.add(current.toString().trim())
-                    current.clear()
-                }
-                else -> current.append(ch)
-            }
+    /**
+     * 查找动作组。
+     *
+     * 查找顺序固定为：当前菜单 `Events.Click.<name>` 优先，全局 actions 包其次。
+     * 这样菜单可以覆盖同名全局包，便于局部定制。
+     */
+    private fun findActionList(config: YamlConfiguration?, actionName: String): ResolvedActionList? {
+        if (actionName.isEmpty()) {
+            return null
         }
 
-        if (escaping) {
-            current.append('\\')
+        val localActions = config
+            ?.getList("Events.Click.$actionName")
+            ?.takeIf { it.isNotEmpty() }
+            ?.map { it ?: Any() }
+        if (localActions != null) {
+            return ResolvedActionList(localActions, "menu:$actionName")
         }
 
-        result.add(current.toString().trim())
-        return result
+        val packageActions = actionPackageManager?.getActions(actionName) ?: return null
+        return ResolvedActionList(packageActions, "package:$actionName")
     }
 
-    private fun stripArgumentQuotes(value: String): String {
-        return value.removeSurrounding("`").removeSurrounding("'").removeSurrounding("\"")
+    private fun actionListNotFoundMessage(actionName: String, config: YamlConfiguration?): String {
+        val key = if (config == null) {
+            "actions.action_list_not_found_global"
+        } else {
+            "actions.action_list_not_found_with_global"
+        }
+        return plugin?.languageManager?.getMessage(key, actionName)
+            ?: plugin?.languageManager?.getMessage("actions.action_list_not_found", actionName)
+            ?: "§cError: Action list '$actionName' not found"
     }
 
+    private fun message(key: String, vararg args: Any): String {
+        return plugin?.languageManager?.getMessage(key, *args)
+            ?: languageManager?.getMessage(key, *args)
+            ?: key
+    }
+
+    /**
+     * 把 actions 调用参数合并到变量表。
+     *
+     * 例如 `actions: hello,玩家,生存服` 会生成 `{arg:0}=玩家`、`{arg:1}=生存服`。
+     */
     private fun mergeActionArguments(variables: Map<String, String>, args: List<String>): Map<String, String> {
         if (args.isEmpty()) {
             return variables
@@ -321,6 +383,13 @@ object MenuActions {
         return merged
     }
 
+    /** 解析 `菜单ID 参数...`，参数分隔和引号规则与 actions 包参数保持一致。 */
+    private fun parseMenuOpenRequest(raw: String): MenuOpenRequest? {
+        val parts = ActionArgumentParser.splitArguments(raw)
+        val menuId = parts.firstOrNull()?.takeIf(String::isNotBlank) ?: return null
+        return MenuOpenRequest(menuId, parts.drop(1))
+    }
+
     /**
      * 解析条件动作 Map，并返回当前玩家应执行的分支。
      * 支持 actions/allow 作为成功分支，deny 作为失败分支。
@@ -328,12 +397,12 @@ object MenuActions {
     private fun selectConditionalActions(
         player: Player,
         group: Map<*, *>,
-        variables: Map<String, String>
+        variables: Map<String, String>,
+        config: YamlConfiguration?
     ): List<*> {
         val condition = group["condition"] as? String ?: ""
-        val resolvedCondition = TextResolver.resolve(player, condition, variables)
         val (successActions, denyActions) = getConditionalBranches(group)
-        return if (ConditionUtils.checkCondition(player, resolvedCondition)) {
+        return if (ConditionUtils.checkCondition(player, condition, variables, config) { null }) {
             successActions
         } else {
             denyActions
@@ -347,106 +416,144 @@ object MenuActions {
     }
 
     /**
-     * 从配置文件中构建一个 DialogAction 对象
+     * 执行菜单按钮路径下的动作列表。
+     *
+     * Paper callback 与 Spigot custom-click session 都通过此入口复用动作编排、输入变量和关闭生命周期。
+     * `closesDialogAfterAction` 表示客户端会在点击后自动关闭当前 Dialog。
      */
-    fun buildActionFromConfig(
+    fun executeConfigActionPath(
         player: Player,
         config: YamlConfiguration,
         path: String,
-        inputKeys: List<String>,
-        inputTypes: Map<String, String>,
-        checkboxMappings: Map<String, Pair<String, String>>,
-        menuOpener: (Player, String) -> Unit,
-        closesDialogAfterAction: Boolean = false
-    ): DialogAction {
-        // 只使用 actions（复数）键
+        variables: Map<String, String> = emptyMap(),
+        menuOpener: ((Player, String) -> Unit)? = null,
+        closesDialogAfterAction: Boolean = false,
+        contextId: String? = null
+    ): CompletableFuture<Boolean> {
         val actionList = config.getList(path)
         if (actionList == null || actionList.isEmpty()) {
-            return DialogAction.customClick({ _, _ ->
-                completeDialogCloseLifecycle(player, config, MenuTaskManager.currentToken(player), closesDialogAfterAction)
-            }, ClickCallback.Options.builder().build())
+            completeDialogCloseLifecycle(player, config, MenuTaskManager.currentToken(player), closesDialogAfterAction)
+            return CompletableFuture.completedFuture(false)
         }
 
-        // 1. 优先处理不需要服务器参与的静态动作 (url, copy)
-        // 仅当只有一个动作且是特定字符串时才执行
-        if (actionList.size == 1) {
-            val firstAction = actionList[0]
-            if (firstAction is String) {
-                when {
-                    firstAction.startsWith("url:") ->
-                        return DialogAction.staticAction(ClickEvent.openUrl(firstAction.removePrefix("url:").trim()))
-                    firstAction.startsWith("copy:") ->
-                        return DialogAction.staticAction(ClickEvent.copyToClipboard(firstAction.removePrefix("copy:").trim()))
-                }
+        val resolvedMenuOpener = menuOpener ?: { target: Player, menuName: String ->
+            plugin?.let { kaMenu ->
+                KaScheduler.runPlayer(target, Runnable {
+                    MenuUI.openMenu(target, menuName, kaMenu.menuManager, kaMenu)
+                })
             }
-            // 如果是Map且包含condition键，走下面的customClick处理路径
-            if (firstAction is Map<*, *>) {
-                if (firstAction.containsKey("condition")) {
-                    // 条件格式动作，继续执行下面的复杂逻辑
-                } else {
-                    // 未知类型的Map，返回无操作
-                    return DialogAction.customClick({ _, _ -> }, ClickCallback.Options.builder().build())
-                }
-            } else if (firstAction !is String) {
-                // 其他非String、非condition的Map类型，返回无操作
-                return DialogAction.customClick({ _, _ -> }, ClickCallback.Options.builder().build())
+            Unit
+        }
+        val initialTaskToken = MenuTaskManager.currentToken(player)
+        val handledMenuLifecycle = AtomicBoolean(false)
+        return executeActionList(
+            player,
+            actionList.map { it ?: Any() },
+            variables,
+            resolvedMenuOpener,
+            config = config,
+            contextId = contextId,
+            handledMenuLifecycle = handledMenuLifecycle
+        ).whenComplete { _, error ->
+            if (error != null) {
+                plugin?.logger?.severe("按钮动作执行失败: ${error.message}")
+                error.printStackTrace()
+            }
+            if (!handledMenuLifecycle.get()) {
+                completeDialogCloseLifecycle(player, config, initialTaskToken, closesDialogAfterAction)
             }
         }
+    }
 
-        // 2. 统一处理所有需要服务器参与的复杂逻辑
-        // (多行指令、变量、声音、条件判断等)
-        return DialogAction.customClick({ response, _ ->
-            val initialTaskToken = MenuTaskManager.currentToken(player)
-            val variables = mutableMapOf<String, String>()
-            inputKeys.forEach { key ->
-                val value = when {
-                    response.getFloat(key) != null -> {
-                        val f = response.getFloat(key)!!
-                        if (f == f.toInt().toFloat()) {
-                            val intVal = f.toInt()
-                            // 检查是否为 checkbox
-                            val mapping = checkboxMappings[key]
-                            if (inputTypes[key] == "checkbox" && mapping != null) {
-                                // checkbox：根据选中状态返回对应的映射值
-                                if (intVal == 1) {
-                                    mapping.first  // 选中状态返回 onTrue
-                                } else {
-                                    mapping.second  // 未选中状态返回 onFalse
-                                }
-                            } else {
-                                // 非 checkbox，保持原值
-                                intVal.toString()
-                            }
-                        } else {
-                            f.toString()
-                        }
-                    }
-                    response.getText(key) != null -> response.getText(key)
-                    response.getBoolean(key) != null -> response.getBoolean(key).toString()
-                    else -> ""
-                }
-                variables[key] = value ?: ""
-            }
-
-            val handledMenuLifecycle = AtomicBoolean(false)
-            executeActionList(
+    /**
+     * 执行编译后 Dialog 按钮绑定的动作。
+     *
+     * 普通按钮使用配置路径，repeat 补位等合成按钮使用内存动作列表；两者共享相同的关闭生命周期。
+     */
+    fun executeDialogButton(
+        player: Player,
+        config: YamlConfiguration,
+        actionPath: String,
+        actionOverride: List<*>?,
+        variables: Map<String, String> = emptyMap(),
+        closesDialogAfterAction: Boolean = false,
+        contextId: String? = null
+    ): CompletableFuture<Boolean> {
+        if (actionOverride == null) {
+            return executeConfigActionPath(
                 player,
-                actionList.map { it ?: Any() },
+                config,
+                actionPath,
                 variables,
-                menuOpener,
-                config = config,
-                handledMenuLifecycle = handledMenuLifecycle
+                closesDialogAfterAction = closesDialogAfterAction,
+                contextId = contextId
             )
-                .whenComplete { _, error ->
-                    if (error != null) {
-                        plugin?.logger?.severe("按钮动作执行失败: ${error.message}")
-                        error.printStackTrace()
-                    }
-                    if (!handledMenuLifecycle.get()) {
-                        completeDialogCloseLifecycle(player, config, initialTaskToken, closesDialogAfterAction)
-                    }
-                }
-        }, ClickCallback.Options.builder().lifetime(Duration.ofMinutes(5)).build())
+        }
+
+        val initialTaskToken = MenuTaskManager.currentToken(player)
+        return executeActionGroup(
+            player,
+            config,
+            actionOverride,
+            variables,
+            contextId = contextId
+        ).whenComplete { _, _ ->
+            completeDialogCloseLifecycle(player, config, initialTaskToken, closesDialogAfterAction)
+        }
+    }
+
+    /** 执行可点击文本引用的菜单内或全局 actions 包，并支持 `{arg:n}` 参数。 */
+    fun executeActionReference(
+        player: Player,
+        config: YamlConfiguration,
+        rawCall: String,
+        variables: Map<String, String> = emptyMap(),
+        contextId: String? = null,
+        closesDialogAfterAction: Boolean = false
+    ): CompletableFuture<Boolean> {
+        val initialTaskToken = MenuTaskManager.currentToken(player)
+        val handledMenuLifecycle = AtomicBoolean(false)
+        val actionCall = parseActionCall(rawCall)
+        val actionList = findActionList(config, actionCall.name)
+        if (actionList == null) {
+            MenuUI.sendMessage(player, TextParser.parseText(actionListNotFoundMessage(actionCall.name, config), player))
+            completeDialogCloseLifecycle(player, config, initialTaskToken, closesDialogAfterAction)
+            return CompletableFuture.completedFuture(false)
+        }
+
+        val menuOpener: (Player, String) -> Unit = { target, menuName ->
+            plugin?.let { kaMenu ->
+                KaScheduler.runPlayer(target, Runnable {
+                    MenuUI.openMenu(target, menuName, kaMenu.menuManager, kaMenu)
+                })
+            }
+        }
+        return executeActionList(
+            player = player,
+            actionList = actionList.actions,
+            variables = mergeActionArguments(variables, actionCall.arguments),
+            menuOpener = menuOpener,
+            config = config,
+            contextId = contextId,
+            actionListId = actionList.id,
+            handledMenuLifecycle = handledMenuLifecycle
+        ).whenComplete { _, _ ->
+            if (!handledMenuLifecycle.get()) {
+                completeDialogCloseLifecycle(player, config, initialTaskToken, closesDialogAfterAction)
+            }
+        }
+    }
+
+    /**
+     * 根据菜单 Settings 创建 Paper callback 生命周期配置。
+     *
+     * uses 固定为 1，确保每个 callback 只能触发一次。
+     */
+    private fun buildCallbackOptions(config: YamlConfiguration): ClickCallback.Options {
+        return ClickCallback.Options.builder()
+            .uses(1)
+            .lifetime(Duration.ofSeconds(DialogSessionManager.lifetimeSeconds(config)))
+            .build()
     }
 
     private fun completeDialogCloseLifecycle(
@@ -455,10 +562,18 @@ object MenuActions {
         initialTaskToken: Long?,
         closesDialogAfterAction: Boolean
     ) {
-        if (!closesDialogAfterAction || initialTaskToken == null) {
+        if (!closesDialogAfterAction) {
             return
         }
-        if (MenuTaskManager.currentToken(player) != initialTaskToken) {
+        val argumentContext = MenuArgumentManager.currentContext(player)
+        DialogSessionManager.cancel(player)
+        if (initialTaskToken == null) {
+            MenuArgumentManager.clearIfCurrent(player, argumentContext)
+            return
+        }
+        if (MenuTaskManager.currentToken(player) != initialTaskToken ||
+            MenuArgumentManager.currentContext(player) != argumentContext
+        ) {
             return
         }
 
@@ -468,18 +583,24 @@ object MenuActions {
                     plugin?.logger?.severe("Close 事件执行失败: ${error.message}")
                     error.printStackTrace()
                 }
-                if (MenuTaskManager.currentToken(player) == initialTaskToken) {
+                if (MenuTaskManager.currentToken(player) == initialTaskToken &&
+                    MenuArgumentManager.currentContext(player) == argumentContext
+                ) {
                     MenuTaskManager.cancel(player)
+                    MenuArgumentManager.clearIfCurrent(player, argumentContext)
                 }
             }
         } else {
             MenuTaskManager.cancel(player)
+            MenuArgumentManager.clearIfCurrent(player, argumentContext)
         }
     }
 
     /**
      * 按顺序执行动作列表。
      * wait 是序列中的暂停节点；条件和普通动作都会在真正轮到该节点时解析变量。
+     *
+     * 返回值含义：`true` 表示动作列表遇到 return 或等价中断，调用方应停止后续流程。
      */
     private fun executeActionList(
         player: Player,
@@ -490,10 +611,22 @@ object MenuActions {
         config: YamlConfiguration? = null,
         asyncDataOperations: Boolean = true,
         taskRef: MenuTaskManager.TaskExecutionRef? = null,
+        contextId: String? = null,
+        actionListId: String? = null,
         handledMenuLifecycle: AtomicBoolean = AtomicBoolean(false)
     ): CompletableFuture<Boolean> {
-        val context = ActionExecutionContext(player, variables, menuOpener, config, asyncDataOperations, taskRef, handledMenuLifecycle)
-        val start = if (baseDelay > 0) delayTicks(baseDelay) else CompletableFuture.completedFuture(false)
+        val context = ActionExecutionContext(
+            player = player,
+            variables = variables,
+            menuOpener = menuOpener,
+            config = config,
+            asyncDataOperations = asyncDataOperations,
+            taskRef = taskRef,
+            contextId = contextId,
+            actionListId = actionListId,
+            handledMenuLifecycle = handledMenuLifecycle
+        )
+        val start = if (baseDelay > 0) delayTicks(player, baseDelay) else CompletableFuture.completedFuture(false)
         return start.thenCompose { executeActionSequence(context, actionList) }
             .exceptionally { error ->
                 plugin?.logger?.severe("动作执行失败: ${error.message}")
@@ -502,18 +635,25 @@ object MenuActions {
             }
     }
 
+    /**
+     * 执行菜单或周期任务传入的一组动作。
+     *
+     * 与 [executeStandaloneActions] 不同，这里有菜单配置，因此支持菜单本地 actions 包、
+     * reset、Close 生命周期、Events.Tasks 上下文等菜单相关能力。
+     */
     fun executeActionGroup(
         player: Player,
         config: YamlConfiguration,
         actions: List<*>,
         variables: Map<String, String> = emptyMap(),
         asyncDataOperations: Boolean = true,
-        taskRef: MenuTaskManager.TaskExecutionRef? = null
+        taskRef: MenuTaskManager.TaskExecutionRef? = null,
+        contextId: String? = null
     ): CompletableFuture<Boolean> {
         val menuOpener: (Player, String) -> Unit = { p, menuName ->
             val kaMenu = Bukkit.getPluginManager().getPlugin("KaMenu") as? KaMenu
             if (kaMenu != null) {
-                Bukkit.getScheduler().runTask(kaMenu, Runnable {
+                KaScheduler.runPlayer(p, Runnable {
                     MenuUI.openMenu(p, menuName, kaMenu.menuManager, kaMenu)
                 })
             }
@@ -526,10 +666,47 @@ object MenuActions {
             menuOpener,
             config = config,
             asyncDataOperations = asyncDataOperations,
-            taskRef = taskRef
+            taskRef = taskRef,
+            contextId = contextId
         )
     }
 
+    /**
+     * 执行脱离菜单配置的动作列表。
+     *
+     * 用于自定义指令等场景。由于没有菜单配置，菜单本地 actions、reset 和 Close 事件不可用，
+     * 但全局 actions 包、内置动作、外部动作和变量仍可使用。
+     */
+    fun executeStandaloneActions(
+        player: Player,
+        actions: List<*>,
+        variables: Map<String, String> = emptyMap(),
+        asyncDataOperations: Boolean = true
+    ): CompletableFuture<Boolean> {
+        val menuOpener: (Player, String) -> Unit = { p, menuName ->
+            val kaMenu = Bukkit.getPluginManager().getPlugin("KaMenu") as? KaMenu
+            if (kaMenu != null) {
+                KaScheduler.runPlayer(p, Runnable {
+                    MenuUI.openMenu(p, menuName, kaMenu.menuManager, kaMenu)
+                })
+            }
+        }
+
+        return executeActionList(
+            player,
+            actions.map { it ?: Any() },
+            variables,
+            menuOpener,
+            config = null,
+            asyncDataOperations = asyncDataOperations
+        )
+    }
+
+    /**
+     * 递归执行动作序列。
+     *
+     * 这里不用简单 for 循环，是因为 `wait:` 会异步完成；递归链可以保证等待后继续下一个节点。
+     */
     private fun executeActionSequence(
         context: ActionExecutionContext,
         actionList: List<Any>,
@@ -548,13 +725,18 @@ object MenuActions {
         }
     }
 
+    /**
+     * 执行单个 YAML 动作节点。
+     *
+     * Map 表示条件分支，List 表示嵌套动作列表，String 表示普通动作文本。
+     */
     private fun executeActionNode(
         context: ActionExecutionContext,
         action: Any
     ): CompletableFuture<Boolean> {
         return when (action) {
             is Map<*, *> -> {
-                val actionsToUse = selectConditionalActions(context.player, action, context.variables)
+                val actionsToUse = selectConditionalActions(context.player, action, context.variables, context.config)
                 executeActionSequence(context, actionsToUse.map { it ?: Any() })
             }
             is List<*> -> executeActionSequence(context, action.map { it ?: Any() })
@@ -563,16 +745,145 @@ object MenuActions {
         }
     }
 
+    /**
+     * 提取单行动作修饰符。
+     *
+     * 支持行尾 `{condition: ...}`、`{chance: ...}` 和 `{wait: ...}`；
+     * 修饰符会在动作交给变量解析器前移除，避免被当作内置变量或 MiniMessage 标签。
+     */
+    private fun parseActionModifiers(action: String): ActionModifiers {
+        var remaining = action.trimEnd()
+        var condition: String? = null
+        var chance: String? = null
+        var delay: String? = null
+        while (remaining.isNotEmpty()) {
+            val parsedCondition = InlineConditionResolver.parse(remaining)
+            if (parsedCondition != null) {
+                condition = parsedCondition.condition
+                remaining = parsedCondition.content
+                continue
+            }
+            val parsedChance = InlineConditionResolver.parseTrailingModifier(remaining, "chance")
+            if (parsedChance != null) {
+                chance = parsedChance.second
+                remaining = parsedChance.first
+                continue
+            }
+            val parsedWait = InlineConditionResolver.parseTrailingModifier(remaining, "wait")
+            if (parsedWait != null) {
+                delay = parsedWait.second
+                remaining = parsedWait.first
+                continue
+            }
+            break
+        }
+        return ActionModifiers(
+            action = remaining.trim(),
+            condition = condition,
+            chance = chance,
+            delay = delay
+        )
+    }
+
+    /** 解析并判定 `0..100` 概率；非法值会跳过该动作并输出本地化警告。 */
+    private fun passesActionChance(context: ActionExecutionContext, rawChance: String?): Boolean {
+        if (rawChance == null) return true
+        val resolved = TextResolver.resolve(context.player, rawChance, context.variables, context.config).trim()
+        val chance = resolved.removeSuffix("%").trim().toDoubleOrNull()
+        if (chance == null || !chance.isFinite()) {
+            plugin?.logger?.warning(message("actions.modifier_invalid_chance", resolved, context.player.name))
+            return false
+        }
+        if (chance <= 0.0) return false
+        if (chance >= 100.0) return true
+        return ThreadLocalRandom.current().nextDouble(100.0) < chance
+    }
+
+    /** 解析单行动作延迟 tick；非法值按不延迟处理并输出本地化警告。 */
+    private fun parseActionDelay(context: ActionExecutionContext, rawDelay: String?): Long {
+        if (rawDelay == null) return 0L
+        val resolved = TextResolver.resolve(context.player, rawDelay, context.variables, context.config).trim()
+        val delay = resolved.toLongOrNull()
+        if (delay == null || delay < 0L) {
+            plugin?.logger?.warning(message("actions.modifier_invalid_delay", resolved, context.player.name))
+            return 0L
+        }
+        return delay
+    }
+
+    /**
+     * 独立调度一行动作，并立即把控制权交还当前动作序列。
+     *
+     * 这与 `wait:` 不同：延迟动作不会阻塞后续行，也不会把延迟后的 `return` 传播回原动作链。
+     */
+    private fun scheduleDetachedAction(context: ActionExecutionContext, action: String, delay: Long) {
+        KaScheduler.runPlayerLater(context.player, delay, Runnable {
+            if (!context.player.isOnline) return@Runnable
+            executeActionString(context, action).whenComplete { _, error ->
+                if (error != null) {
+                    plugin?.logger?.warning(message(
+                        "actions.delayed_action_failed",
+                        context.player.name,
+                        error.message ?: error.javaClass.simpleName
+                    ))
+                }
+            }
+        })
+    }
+
+    /**
+     * 执行字符串动作中的控制指令。
+     *
+     * `wait`、`return`、`actions`、`page`、`stop-current-task` 会影响执行序列本身，
+     * 其他动作会交给 [executeSingleAction] 执行。
+     */
     private fun executeActionString(
         context: ActionExecutionContext,
         action: String
     ): CompletableFuture<Boolean> {
-        val controlAction = TextResolver.resolve(context.player, action, context.variables).trim()
+        val modifiers = parseActionModifiers(action)
+        if (modifiers.action.isEmpty() ||
+            (modifiers.condition != null && !ConditionExpressionEngine.checkCondition(
+                context.player,
+                modifiers.condition,
+                context.variables,
+                context.config
+            ) { null }) ||
+            !passesActionChance(context, modifiers.chance)
+        ) {
+            return CompletableFuture.completedFuture(false)
+        }
+        val actionDelay = parseActionDelay(context, modifiers.delay)
+        if (actionDelay > 0L) {
+            scheduleDetachedAction(context, modifiers.action, actionDelay)
+            return CompletableFuture.completedFuture(false)
+        }
+
+        val controlAction = TextResolver.resolve(
+            context.player,
+            modifiers.action,
+            context.variables,
+            context.config
+        ).trim()
 
         return when {
             controlAction.startsWith("wait:", ignoreCase = true) -> {
                 val ticks = controlAction.substringAfter(":", "").trim().toLongOrNull() ?: 0L
-                delayTicks(ticks).thenApply { false }
+                delayTicks(context.player, ticks).thenApply { false }
+            }
+            controlAction.equals("refresh", ignoreCase = true) ||
+                controlAction.startsWith("refresh:", ignoreCase = true) -> {
+                val target = controlAction.substringAfter(":", "").trim()
+                plugin?.takeIf { it.containerMenusReady }
+                    ?.containerMenuService
+                    ?.refreshFromAction(context.player, target)
+                CompletableFuture.completedFuture(false)
+            }
+            controlAction.startsWith("free-slot:", ignoreCase = true) -> {
+                plugin?.takeIf { it.containerMenusReady }
+                    ?.containerMenuService
+                    ?.executeFreeSlotAction(context.player, controlAction.substringAfter(":", "").trim())
+                    ?: CompletableFuture.completedFuture(true)
             }
             controlAction.equals("return", ignoreCase = true) -> {
                 CompletableFuture.completedFuture(true)
@@ -581,30 +892,40 @@ object MenuActions {
                 context.taskRef?.let { MenuTaskManager.stopTask(it) }
                 CompletableFuture.completedFuture(true)
             }
+            controlAction.startsWith("page:", ignoreCase = true) -> {
+                handlePageAction(context.player, controlAction, context.config, context.contextId)
+                CompletableFuture.completedFuture(false)
+            }
             controlAction.startsWith("actions:", ignoreCase = true) -> {
                 val actionCall = parseActionCall(controlAction.substringAfter(":", "").trim())
-                val config = context.config
-                if (config == null || actionCall.name.isEmpty()) {
+                if (actionCall.name.isEmpty()) {
                     CompletableFuture.completedFuture(false)
                 } else {
-                    val subActionList = config.getList("Events.Click.${actionCall.name}")
-                    if (subActionList.isNullOrEmpty()) {
-                        context.player.sendMessage(TextParser.parseText(plugin?.languageManager?.getMessage("actions.action_list_not_found", actionCall.name)))
+                    val subActionList = findActionList(context.config, actionCall.name)
+                    if (subActionList == null) {
+                        MenuUI.sendMessage(context.player, TextParser.parseText(actionListNotFoundMessage(actionCall.name, context.config)))
+                        CompletableFuture.completedFuture(false)
+                    } else if (subActionList.id == context.actionListId) {
+                        MenuUI.sendMessage(context.player, TextParser.parseText(plugin?.languageManager?.getMessage("actions.action_list_self_call", actionCall.name)))
                         CompletableFuture.completedFuture(false)
                     } else {
-                        val childContext = context.copy(variables = mergeActionArguments(context.variables, actionCall.arguments))
-                        executeActionSequence(childContext, subActionList.map { it ?: Any() })
+                        val childContext = context.copy(
+                            variables = mergeActionArguments(context.variables, actionCall.arguments),
+                            actionListId = subActionList.id
+                        )
+                        executeActionSequence(childContext, subActionList.actions)
                     }
                 }
             }
             else -> {
                 executeSingleAction(
                     context.player,
-                    action,
+                    modifiers.action,
                     context.variables,
                     context.menuOpener,
                     context.config,
                     context.asyncDataOperations,
+                    context.contextId,
                     context.handledMenuLifecycle
                 )
                 CompletableFuture.completedFuture(false)
@@ -612,28 +933,56 @@ object MenuActions {
         }
     }
 
-    private fun delayTicks(ticks: Long): CompletableFuture<Boolean> {
+    private fun delayTicks(player: Player, ticks: Long): CompletableFuture<Boolean> {
         if (ticks <= 0) {
             return CompletableFuture.completedFuture(false)
         }
 
-        val currentPlugin = plugin ?: return CompletableFuture.completedFuture(false)
         val future = CompletableFuture<Boolean>()
-        Bukkit.getScheduler().runTaskLater(currentPlugin, Runnable {
+        KaScheduler.runPlayerLater(player, ticks, Runnable {
             future.complete(false)
-        }, ticks)
+        })
         return future
     }
 
     /**
+     * 处理 repeat 按钮分页动作。
+     *
+     * 语法：`page: <listId> next|prev|+N|-N|pageNumber`。
+     */
+    private fun handlePageAction(player: Player, action: String, config: YamlConfiguration?, contextId: String?) {
+        val currentPlugin = plugin ?: return
+        val currentConfig = config ?: return
+        val args = action.substringAfter(":", "").trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (args.size < 2) {
+            return
+        }
+
+        val listId = args[0]
+        val operation = args[1].lowercase()
+        val resolvedContextId = contextId ?: currentPlugin.menuManager.getMenuId(currentConfig) ?: "external:${System.identityHashCode(currentConfig)}"
+
+        when {
+            operation == "next" -> MenuListManager.movePage(player, resolvedContextId, listId, 1)
+            operation == "prev" || operation == "previous" -> MenuListManager.movePage(player, resolvedContextId, listId, -1)
+            operation.startsWith("+") -> MenuListManager.movePage(player, resolvedContextId, listId, operation.drop(1).toIntOrNull() ?: 0)
+            operation.startsWith("-") -> MenuListManager.movePage(player, resolvedContextId, listId, operation.toIntOrNull() ?: 0)
+            else -> operation.toIntOrNull()?.let { MenuListManager.setPage(player, resolvedContextId, listId, it) }
+        }
+    }
+
+    /**
      * 执行事件动作（如 Open、Close 等）- 异步版本
-     * 事件动作不支持 $(input) 变量，因为菜单还未打开
+     *
+     * Open 事件必须等待整个动作列表完成；如果中途遇到 `return`，调用方应停止打开菜单。
+     * 事件动作没有输入组件响应，因此不能读取输入捕获变量。
+     *
      * @param player 玩家对象
      * @param config 菜单配置
      * @param eventName 事件名称（如 "Open"、"Close" 等）
      * @return CompletableFuture 包含是否应该中断后续操作（true表示中断，例如Open事件中遇到return）
      */
-    fun executeEvent(player: Player, config: YamlConfiguration, eventName: String): CompletableFuture<Boolean> {
+    fun executeEvent(player: Player, config: YamlConfiguration, eventName: String, contextId: String? = null): CompletableFuture<Boolean> {
         val eventPath = "Events.$eventName"
         val eventActions = config.getList(eventPath) ?: return CompletableFuture.completedFuture(false)
 
@@ -641,7 +990,7 @@ object MenuActions {
         val menuOpener: (Player, String) -> Unit = { p, menuName ->
             val kaMenu = Bukkit.getPluginManager().getPlugin("KaMenu") as? KaMenu
             if (kaMenu != null) {
-                Bukkit.getScheduler().runTask(kaMenu, Runnable {
+                KaScheduler.runPlayer(p, Runnable {
                     MenuUI.openMenu(p, menuName, kaMenu.menuManager, kaMenu)
                 })
             }
@@ -655,19 +1004,22 @@ object MenuActions {
             menuOpener,
             0L,
             config,
-            asyncDataOperations = true
+            asyncDataOperations = true,
+            contextId = contextId
         )
     }
 
     /**
      * 执行事件动作（如 Open、Close 等）- 同步版本
-     * 用于不包含 wait 动作的情况
+     *
+     * 用于调用方明确需要同步结果的场景。若动作内包含 wait，仍会通过 future 链等待完成。
+     *
      * @param player 玩家对象
      * @param config 菜单配置
      * @param eventName 事件名称（如 "Open"、"Close" 等）
      * @return 是否应该中断后续操作（true表示中断，例如Open事件中遇到return）
      */
-    fun executeEventSync(player: Player, config: YamlConfiguration, eventName: String): Boolean {
+    fun executeEventSync(player: Player, config: YamlConfiguration, eventName: String, contextId: String? = null): Boolean {
         val eventPath = "Events.$eventName"
         val eventActions = config.getList(eventPath) ?: return false
 
@@ -675,7 +1027,7 @@ object MenuActions {
         val menuOpener: (Player, String) -> Unit = { p, menuName ->
             val kaMenu = Bukkit.getPluginManager().getPlugin("KaMenu") as? KaMenu
             if (kaMenu != null) {
-                Bukkit.getScheduler().runTask(kaMenu, Runnable {
+                KaScheduler.runPlayer(p, Runnable {
                     MenuUI.openMenu(p, menuName, kaMenu.menuManager, kaMenu)
                 })
             }
@@ -686,12 +1038,15 @@ object MenuActions {
             eventActions.map { it ?: Any() },
             emptyMap(),
             menuOpener,
-            config = config
+            config = config,
+            contextId = contextId
         ).get()
     }
 
     /**
-     * 检查动作列表中是否包含 wait 动作（公开方法）
+     * 检查动作列表中是否包含 wait 动作。
+     *
+     * 主要用于旧逻辑兼容和判断是否需要异步等待事件结果。
      */
     fun hasWaitActionInList(actionList: List<*>): Boolean {
         return hasWaitAction(actionList)
@@ -733,7 +1088,9 @@ object MenuActions {
     }
 
     /**
-     * 执行单个动作（支持目标选择器）
+     * 执行单个动作（支持目标选择器）。
+     *
+     * 目标选择器形如 `{player:*}` 或 `{player:condition}`，只有多目标安全的动作会扩散到多个玩家。
      */
     private fun executeSingleAction(
         player: Player,
@@ -742,6 +1099,7 @@ object MenuActions {
         menuOpener: (Player, String) -> Unit,
         config: YamlConfiguration? = null,
         asyncDataOperations: Boolean = true,
+        contextId: String? = null,
         handledMenuLifecycle: AtomicBoolean? = null
     ) {
         // 解析目标选择器
@@ -756,7 +1114,7 @@ object MenuActions {
         when {
             // 不支持多目标的动作，只对当前玩家执行
             actionType == ActionType.SINGLE_TARGET_ONLY || selector == null -> {
-                executeActionForPlayer(player, actionWithoutSelector, variables, menuOpener, config, asyncDataOperations, handledMenuLifecycle)
+                executeActionForPlayer(player, actionWithoutSelector, variables, menuOpener, config, asyncDataOperations, contextId, handledMenuLifecycle)
             }
 
             // 支持多目标的动作，获取所有目标玩家并执行
@@ -769,14 +1127,17 @@ object MenuActions {
 
                 // 对每个目标玩家执行动作
                 targetPlayers.forEach { targetPlayer ->
-                    executeActionForPlayer(targetPlayer, actionWithoutSelector, variables, menuOpener, config, asyncDataOperations, handledMenuLifecycle)
+                    executeActionForPlayer(targetPlayer, actionWithoutSelector, variables, menuOpener, config, asyncDataOperations, contextId, handledMenuLifecycle)
                 }
             }
         }
     }
 
     /**
-     * 对单个玩家执行动作
+     * 对单个玩家执行动作。
+     *
+     * 这里是内置动作分发表。进入此方法前会完成变量解析；若命中外部 namespace handler，
+     * 外部 handler 会优先消费动作，返回后不再执行内置逻辑。
      */
     private fun executeActionForPlayer(
         player: Player,
@@ -785,91 +1146,55 @@ object MenuActions {
         menuOpener: (Player, String) -> Unit,
         config: YamlConfiguration? = null,
         asyncDataOperations: Boolean = true,
+        contextId: String? = null,
         handledMenuLifecycle: AtomicBoolean? = null
     ) {
         // 解析输入变量、动作包参数、内置变量、JavaScript 与 PAPI 变量
-        val finalCmd = TextResolver.resolve(player, action, variables)
+        val finalCmd = TextResolver.resolve(player, action, variables, config)
 
         if (dispatchExternalAction(player, finalCmd, variables, config)) {
             return
         }
 
+        val pointsAlias = parsePointsAlias(finalCmd)
+
         when {
             // tell: 普通消息
             finalCmd.startsWith("tell:") ->
-                player.sendMessage(TextParser.parseText(finalCmd.removePrefix("tell:").trim()))
+                MenuUI.sendMessage(player, TextParser.parseText(finalCmd.removePrefix("tell:").trim()))
 
-            // js: 执行 JavaScript 代码或预定义函数
+            // js: 执行 JavaScript 代码或 JavaScript 包
             finalCmd.startsWith("js:") -> {
                 if (JavaScriptManager.isAvailable()) {
                     val jsCode = finalCmd.removePrefix("js:").trim()
 
                     try {
-                        // 检查是否是预定义函数格式 [function_name]
-                        if (jsCode.startsWith("[") && config != null) {
-                            // 预处理：提取函数名和参数
-                            val trimmed = jsCode.trim()
-                            val closeBracketIndex = trimmed.indexOf(']')
-
-                            if (closeBracketIndex > 0) {
-                                // 提取函数名（在 [ 和 ] 之间）
-                                val functionName = trimmed.substring(1, closeBracketIndex)
-
-                                // 提取参数（在 ] 之后）
-                                var firstSpaceIndex = -1
-                                for (i in (closeBracketIndex + 1) until trimmed.length) {
-                                    if (trimmed[i].isWhitespace()) {
-                                        firstSpaceIndex = i
-                                        break
-                                    }
-                                }
-
-                                val argsString = if (firstSpaceIndex > closeBracketIndex) {
-                                    trimmed.substring(firstSpaceIndex).trim()
-                                } else {
-                                    ""
-                                }
-
-                                // 执行预定义函数并传递参数
-                                val result = JavaScriptManager.executePredefinedFunctionWithArgs(player, functionName, argsString, config)
-                                if (result != null && result != "") {
-                                    // 如果有返回值，显示给玩家（可选）
-                                    player.sendMessage(TextParser.parseText("§aJS Result: $result"))
-                                }
-                            } else {
-                                // 格式错误，直接当作代码执行
-                                val result = JavaScriptManager.evaluateWithContext(player, jsCode)
-                                if (result != null && result != "") {
-                                    player.sendMessage(TextParser.parseText("§aJS Result: $result"))
-                                }
-                            }
+                        val jsCall = ActionArgumentParser.parseBracketCall(jsCode)
+                        if (jsCall != null) {
+                            JavaScriptManager.executePredefinedFunctionWithArgs(player, jsCall.name, jsCall.arguments, config)
                         } else {
-                            // 直接执行 JavaScript 代码
-                            val result = JavaScriptManager.evaluateWithContext(player, jsCode)
-                            if (result != null && result != "") {
-                                // 如果有返回值，显示给玩家（可选）
-                                player.sendMessage(TextParser.parseText("§aJS Result: $result"))
-                            }
+                            JavaScriptManager.evaluateWithContext(player, jsCode)
                         }
                     } catch (e: Exception) {
-                        plugin?.logger?.warning("JavaScript execution error for player ${player.name}: ${e.message}")
-                        player.sendMessage(TextParser.parseText("§cJavaScript execution failed: ${e.message}"))
+                        val error = e.message ?: e.javaClass.simpleName
+                        plugin?.logger?.warning(message("javascript.execution_error_player", player.name, error))
+                        MenuUI.sendMessage(player, TextParser.parseText(message("javascript.execution_failed_user", error)))
                     }
                 } else {
-                    player.sendMessage(TextParser.parseText("§cJavaScript feature is not available. Please restart the server to complete the initial setup."))
+                    MenuUI.sendMessage(player, TextParser.parseText(message("javascript.unavailable")))
                 }
             }
 
             // actionbar: ActionBar 消息
             finalCmd.startsWith("actionbar:") -> {
                 val message = finalCmd.removePrefix("actionbar:").trim()
-                player.sendActionBar(TextParser.parseText(message))
+                MenuUI.sendActionBar(player, TextParser.parseText(message))
             }
 
             // title: 发送标题
             finalCmd.startsWith("title:") -> {
                 val args = finalCmd.removePrefix("title:").trim()
-                Bukkit.getScheduler().runTask(plugin ?: return, Runnable {
+                KaScheduler.runPlayer(player, Runnable {
                     ActionHandlers.parseAndSendTitle(player, args)
                 })
             }
@@ -877,14 +1202,13 @@ object MenuActions {
             // hovertext: 可点击文本
             finalCmd.startsWith("hovertext:") -> {
                 val text = finalCmd.removePrefix("hovertext:").trim()
-                val message = parseClickableText(text, player, config, menuOpener)
-                player.sendMessage(message)
+                MenuUI.sendClickableText(player, text, config, contextId)
             }
 
             // command: 玩家执行指令
             finalCmd.startsWith("command:") -> {
                 val cmd = finalCmd.removePrefix("command:").trim()
-                Bukkit.getScheduler().runTask(plugin ?: return, Runnable {
+                KaScheduler.runPlayer(player, Runnable {
                     player.performCommand(cmd)
                 })
             }
@@ -892,7 +1216,7 @@ object MenuActions {
             // chat: 玩家执行指令
             finalCmd.startsWith("chat:") -> {
                 val cmd = finalCmd.removePrefix("chat:").trim()
-                Bukkit.getScheduler().runTask(plugin ?: return, Runnable {
+                KaScheduler.runPlayer(player, Runnable {
                     player.chat(cmd)
                 })
             }
@@ -900,7 +1224,7 @@ object MenuActions {
             // console: 控制台执行指令
             finalCmd.startsWith("console:") -> {
                 val cmd = finalCmd.removePrefix("console:").trim()
-                Bukkit.getScheduler().runTask(plugin ?: return, Runnable {
+                KaScheduler.runGlobal(Runnable {
                     Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd)
                 })
             }
@@ -908,7 +1232,7 @@ object MenuActions {
             // sound: 播放声音 (支持音量和音调参数)
             finalCmd.startsWith("sound:") -> {
                 val args = finalCmd.removePrefix("sound:").trim()
-                Bukkit.getScheduler().runTask(plugin ?: return, Runnable {
+                KaScheduler.runPlayer(player, Runnable {
                     ActionHandlers.parseAndPlaySound(player, args)
                 })
             }
@@ -941,19 +1265,42 @@ object MenuActions {
 
             // open: 打开另一个对话框（会执行 Events.Open）
             finalCmd.startsWith("open:") -> {
-                val menuName = finalCmd.removePrefix("open:").trim()
-                handledMenuLifecycle?.set(true)
-                menuOpener(player, menuName)
+                val request = parseMenuOpenRequest(finalCmd.removePrefix("open:").trim())
+                if (request != null) {
+                    handledMenuLifecycle?.set(true)
+                    val kaMenu = plugin
+                    if (kaMenu != null) {
+                        KaScheduler.runPlayer(player, Runnable {
+                            MenuUI.openMenu(
+                                player,
+                                request.menuId,
+                                kaMenu.menuManager,
+                                kaMenu,
+                                request.arguments,
+                                variables
+                            )
+                        })
+                    } else if (request.arguments.isEmpty()) {
+                        menuOpener(player, request.menuId)
+                    }
+                }
             }
 
             // force-open: 强制打开菜单（不执行 Events.Open）
             finalCmd.startsWith("force-open:") -> {
-                val menuName = finalCmd.removePrefix("force-open:").trim()
-                val kaMenu = Bukkit.getPluginManager().getPlugin("KaMenu") as? KaMenu
-                if (kaMenu != null) {
-                    Bukkit.getScheduler().runTask(kaMenu, Runnable {
-                        handledMenuLifecycle?.set(true)
-                        MenuUI.forceOpenMenu(player, menuName, kaMenu.menuManager, kaMenu)
+                val request = parseMenuOpenRequest(finalCmd.removePrefix("force-open:").trim())
+                val kaMenu = plugin
+                if (request != null && kaMenu != null) {
+                    handledMenuLifecycle?.set(true)
+                    KaScheduler.runPlayer(player, Runnable {
+                        MenuUI.forceOpenMenu(
+                            player,
+                            request.menuId,
+                            kaMenu.menuManager,
+                            kaMenu,
+                            request.arguments,
+                            variables
+                        )
                     })
                 }
             }
@@ -964,22 +1311,57 @@ object MenuActions {
                     val kaMenu = Bukkit.getPluginManager().getPlugin("KaMenu") as? KaMenu
                     if (kaMenu != null) {
                         val currentMenuId = kaMenu.menuManager.getMenuId(config)
+                        val currentArguments = MenuArgumentManager.current(player)
                         if (currentMenuId != null) {
-                            Bukkit.getScheduler().runTask(kaMenu, Runnable {
+                            KaScheduler.runPlayer(player, Runnable {
                                 handledMenuLifecycle?.set(true)
-                                MenuUI.forceOpenMenu(player, currentMenuId, kaMenu.menuManager, kaMenu)
+                                MenuUI.forceOpenMenu(
+                                    player,
+                                    currentMenuId,
+                                    kaMenu.menuManager,
+                                    kaMenu,
+                                    currentArguments
+                                )
+                            })
+                        } else {
+                            KaScheduler.runPlayer(player, Runnable {
+                                handledMenuLifecycle?.set(true)
+                                MenuUI.forceOpenConfig(
+                                    player,
+                                    config,
+                                    kaMenu,
+                                    contextId ?: "external",
+                                    currentArguments
+                                )
                             })
                         }
                     }
                 }
             }
 
+            // set-args: 替换当前菜单参数，并刷新当前 Container 或 Dialog
+            finalCmd.startsWith("set-args:", ignoreCase = true) -> {
+                val arguments = ActionArgumentParser.splitArguments(finalCmd.substringAfter(":", ""))
+                replaceMenuArgumentsAndRefresh(
+                    player,
+                    arguments,
+                    config,
+                    contextId,
+                    handledMenuLifecycle
+                )
+            }
+
+            // del-args: 清理当前菜单参数，不主动刷新菜单
+            finalCmd.equals("del-args", ignoreCase = true) -> MenuArgumentManager.clear(player)
+
             // force-close: 强制关闭菜单（不执行 Events.Close）
             finalCmd.trim() == "force-close" -> {
                 handledMenuLifecycle?.set(true)
-                Bukkit.getScheduler().runTask(plugin ?: return, Runnable {
+                KaScheduler.runPlayer(player, Runnable {
+                    DialogSessionManager.cancel(player)
                     MenuTaskManager.cancel(player)
-                    player.closeInventory()
+                    MenuUI.closeDialog(player)
+                    MenuArgumentManager.clear(player)
                 })
             }
 
@@ -991,6 +1373,11 @@ object MenuActions {
                     // 检查是否有 Close 事件
                     val hasCloseEvent = config.contains("Events.Close")
                     if (hasCloseEvent) {
+                        val argumentContext = MenuArgumentManager.currentContext(player)
+                        val containerSessionId = plugin
+                            ?.takeIf { it.containerMenusReady }
+                            ?.containerMenuService
+                            ?.currentSessionId(player)
                         // 异步执行 Close 事件，不等待结果（避免阻塞）
                         executeEvent(player, config, "Close").whenComplete { result, error ->
                             if (error != null) {
@@ -998,46 +1385,72 @@ object MenuActions {
                                 error.printStackTrace()
                             } else if (!result) {
                                 // Close 事件中没有 return，关闭菜单
-                                Bukkit.getScheduler().runTask(plugin ?: return@whenComplete, Runnable {
+                                KaScheduler.runPlayer(player, Runnable {
+                                    if (containerSessionId != null) {
+                                        if (plugin?.containerMenuService?.closeSilentlyIfCurrent(player, containerSessionId) == true) {
+                                            MenuArgumentManager.clearIfCurrent(player, argumentContext)
+                                        }
+                                        return@Runnable
+                                    }
+                                    DialogSessionManager.cancel(player)
                                     MenuTaskManager.cancel(player)
-                                    player.closeInventory()
+                                    MenuUI.closeDialog(player)
+                                    MenuArgumentManager.clearIfCurrent(player, argumentContext)
+                                })
+                            } else if (containerSessionId != null) {
+                                // Container 的 Close 被 return 拦截时保留当前会话，并重新解析完整显示状态。
+                                KaScheduler.runPlayer(player, Runnable {
+                                    val service = plugin?.containerMenuService ?: return@Runnable
+                                    if (service.currentSessionId(player) == containerSessionId) {
+                                        service.refreshFromAction(player, "*")
+                                    }
                                 })
                             }
-                            // 如果 result 为 true（Close 事件中遇到 return），不关闭菜单
                         }
                         return  // 提前返回，不在这里关闭菜单
                     }
                 }
                 // 没有 Close 事件，直接关闭菜单
-                Bukkit.getScheduler().runTask(plugin ?: return, Runnable {
+                val argumentContext = MenuArgumentManager.currentContext(player)
+                KaScheduler.runPlayer(player, Runnable {
+                    val containerSessionId = plugin
+                        ?.takeIf { it.containerMenusReady }
+                        ?.containerMenuService
+                        ?.currentSessionId(player)
+                    if (containerSessionId != null) {
+                        if (plugin?.containerMenuService?.closeSilentlyIfCurrent(player, containerSessionId) == true) {
+                            MenuArgumentManager.clearIfCurrent(player, argumentContext)
+                        }
+                        return@Runnable
+                    }
+                    DialogSessionManager.cancel(player)
                     MenuTaskManager.cancel(player)
-                    player.closeInventory()
+                    MenuUI.closeDialog(player)
+                    MenuArgumentManager.clearIfCurrent(player, argumentContext)
                 })
             }
 
             // actions: 执行 Events.Click 下的动作列表
             finalCmd.startsWith("actions:") -> {
                 if (config != null) {
-                    val actionKey = finalCmd.removePrefix("actions:").trim()
-                    if (actionKey.isNotEmpty()) {
-                        // 异步执行动作列表
-                        Bukkit.getScheduler().runTaskAsynchronously(plugin ?: return, Runnable {
-                            val actionPath = "Events.Click.$actionKey"
-                            val actionList = config.getList(actionPath)
+                    val actionCall = parseActionCall(finalCmd.removePrefix("actions:").trim())
+                    if (actionCall.name.isNotEmpty()) {
+                        val actionList = findActionList(config, actionCall.name)
 
-                            if (actionList != null && actionList.isNotEmpty()) {
-                                executeActionList(
-                                    player,
-                                    actionList.map { it ?: Any() },
-                                    mapOf(),
-                                    menuOpener,
-                                    0L,
-                                    config
-                                )
-                            } else {
-                                player.sendMessage(TextParser.parseText(plugin!!.languageManager.getMessage("actions.action_list_not_found", actionKey)))
-                            }
-                        })
+                        if (actionList != null) {
+                            executeActionList(
+                                player,
+                                actionList.actions,
+                                mergeActionArguments(variables, actionCall.arguments),
+                                menuOpener,
+                                0L,
+                                config,
+                                contextId = contextId,
+                                actionListId = actionList.id
+                            )
+                        } else {
+                            MenuUI.sendMessage(player, TextParser.parseText(actionListNotFoundMessage(actionCall.name, config)))
+                        }
                     }
                 }
             }
@@ -1048,7 +1461,7 @@ object MenuActions {
                 ActionHandlers.parseDataAction(args, player.uniqueId.toString(), "data") { uuid, key, value ->
                     if (asyncDataOperations) {
                         // 异步执行数据库操作，避免阻塞主线程
-                        Bukkit.getScheduler().runTaskAsynchronously(plugin ?: return@parseDataAction, Runnable {
+                        KaScheduler.runAsync(Runnable {
                             databaseManager?.setPlayerData(java.util.UUID.fromString(uuid), key, value)
                         })
                     } else {
@@ -1068,7 +1481,7 @@ object MenuActions {
                     setAction = { key, value ->
                         if (asyncDataOperations) {
                             // 异步执行数据库操作，避免阻塞主线程
-                            Bukkit.getScheduler().runTaskAsynchronously(plugin ?: return@parseAndExecuteDataAction, Runnable {
+                            KaScheduler.runAsync(Runnable {
                                 databaseManager?.setPlayerData(player.uniqueId, key, value)
                             })
                         } else {
@@ -1079,7 +1492,7 @@ object MenuActions {
                     modifyAction = { key, delta ->
                         if (asyncDataOperations) {
                             // 异步执行数据库操作，避免阻塞主线程
-                            Bukkit.getScheduler().runTaskAsynchronously(plugin ?: return@parseAndExecuteDataAction, Runnable {
+                            KaScheduler.runAsync(Runnable {
                                 databaseManager?.modifyPlayerData(player.uniqueId, key, delta)
                             })
                         } else {
@@ -1090,11 +1503,66 @@ object MenuActions {
                     deleteAction = { key ->
                         if (asyncDataOperations) {
                             // 异步执行数据库操作，避免阻塞主线程
-                            Bukkit.getScheduler().runTaskAsynchronously(plugin ?: return@parseAndExecuteDataAction, Runnable {
+                            KaScheduler.runAsync(Runnable {
                                 databaseManager?.deletePlayerData(player.uniqueId, key)
                             })
                         } else {
                             // 同步执行数据库操作，确保数据在菜单渲染前完成
+                            databaseManager?.deletePlayerData(player.uniqueId, key)
+                        }
+                    }
+                )
+            }
+
+            // list: 玩家列表数据操作
+            finalCmd.startsWith("list:") -> {
+                val args = finalCmd.removePrefix("list:").trim()
+                ActionHandlers.parseAndExecuteListAction(
+                    args = args,
+                    player = player,
+                    dataType = "list",
+                    setAction = { key, values ->
+                        if (asyncDataOperations) {
+                            KaScheduler.runAsync(Runnable {
+                                databaseManager?.setPlayerList(player.uniqueId, key, values)
+                            })
+                        } else {
+                            databaseManager?.setPlayerList(player.uniqueId, key, values)
+                        }
+                    },
+                    addAction = { key, values, unique ->
+                        if (asyncDataOperations) {
+                            KaScheduler.runAsync(Runnable {
+                                databaseManager?.addPlayerListValues(player.uniqueId, key, values, unique)
+                            })
+                        } else {
+                            databaseManager?.addPlayerListValues(player.uniqueId, key, values, unique)
+                        }
+                    },
+                    removeAction = { key, values ->
+                        if (asyncDataOperations) {
+                            KaScheduler.runAsync(Runnable {
+                                databaseManager?.removePlayerListValues(player.uniqueId, key, values)
+                            })
+                        } else {
+                            databaseManager?.removePlayerListValues(player.uniqueId, key, values)
+                        }
+                    },
+                    clearAction = { key ->
+                        if (asyncDataOperations) {
+                            KaScheduler.runAsync(Runnable {
+                                databaseManager?.clearPlayerList(player.uniqueId, key)
+                            })
+                        } else {
+                            databaseManager?.clearPlayerList(player.uniqueId, key)
+                        }
+                    },
+                    deleteAction = { key ->
+                        if (asyncDataOperations) {
+                            KaScheduler.runAsync(Runnable {
+                                databaseManager?.deletePlayerData(player.uniqueId, key)
+                            })
+                        } else {
                             databaseManager?.deletePlayerData(player.uniqueId, key)
                         }
                     }
@@ -1107,9 +1575,9 @@ object MenuActions {
                 ActionHandlers.parseDataAction(args, "", "gdata") { _, key, value ->
                     if (asyncDataOperations) {
                         // 异步执行数据库操作，避免阻塞主线程
-                        Bukkit.getScheduler().runTaskAsynchronously(plugin ?: return@parseDataAction, Runnable {
-                            databaseManager?.setGlobalData(key, value)
-                        })
+                            KaScheduler.runAsync(Runnable {
+                                databaseManager?.setGlobalData(key, value)
+                            })
                     } else {
                         // 同步执行数据库操作，确保数据在菜单渲染前完成
                         databaseManager?.setGlobalData(key, value)
@@ -1127,7 +1595,7 @@ object MenuActions {
                     setAction = { key, value ->
                         if (asyncDataOperations) {
                             // 异步执行数据库操作，避免阻塞主线程
-                            Bukkit.getScheduler().runTaskAsynchronously(plugin ?: return@parseAndExecuteDataAction, Runnable {
+                            KaScheduler.runAsync(Runnable {
                                 databaseManager?.setGlobalData(key, value)
                             })
                         } else {
@@ -1138,7 +1606,7 @@ object MenuActions {
                     modifyAction = { key, delta ->
                         if (asyncDataOperations) {
                             // 异步执行数据库操作，避免阻塞主线程
-                            Bukkit.getScheduler().runTaskAsynchronously(plugin ?: return@parseAndExecuteDataAction, Runnable {
+                            KaScheduler.runAsync(Runnable {
                                 databaseManager?.modifyGlobalData(key, delta)
                             })
                         } else {
@@ -1149,11 +1617,66 @@ object MenuActions {
                     deleteAction = { key ->
                         if (asyncDataOperations) {
                             // 异步执行数据库操作，避免阻塞主线程
-                            Bukkit.getScheduler().runTaskAsynchronously(plugin ?: return@parseAndExecuteDataAction, Runnable {
+                            KaScheduler.runAsync(Runnable {
                                 databaseManager?.deleteGlobalData(key)
                             })
                         } else {
                             // 同步执行数据库操作，确保数据在菜单渲染前完成
+                            databaseManager?.deleteGlobalData(key)
+                        }
+                    }
+                )
+            }
+
+            // glist: 全局列表数据操作
+            finalCmd.startsWith("glist:") -> {
+                val args = finalCmd.removePrefix("glist:").trim()
+                ActionHandlers.parseAndExecuteListAction(
+                    args = args,
+                    player = player,
+                    dataType = "glist",
+                    setAction = { key, values ->
+                        if (asyncDataOperations) {
+                            KaScheduler.runAsync(Runnable {
+                                databaseManager?.setGlobalList(key, values)
+                            })
+                        } else {
+                            databaseManager?.setGlobalList(key, values)
+                        }
+                    },
+                    addAction = { key, values, unique ->
+                        if (asyncDataOperations) {
+                            KaScheduler.runAsync(Runnable {
+                                databaseManager?.addGlobalListValues(key, values, unique)
+                            })
+                        } else {
+                            databaseManager?.addGlobalListValues(key, values, unique)
+                        }
+                    },
+                    removeAction = { key, values ->
+                        if (asyncDataOperations) {
+                            KaScheduler.runAsync(Runnable {
+                                databaseManager?.removeGlobalListValues(key, values)
+                            })
+                        } else {
+                            databaseManager?.removeGlobalListValues(key, values)
+                        }
+                    },
+                    clearAction = { key ->
+                        if (asyncDataOperations) {
+                            KaScheduler.runAsync(Runnable {
+                                databaseManager?.clearGlobalList(key)
+                            })
+                        } else {
+                            databaseManager?.clearGlobalList(key)
+                        }
+                    },
+                    deleteAction = { key ->
+                        if (asyncDataOperations) {
+                            KaScheduler.runAsync(Runnable {
+                                databaseManager?.deleteGlobalData(key)
+                            })
+                        } else {
                             databaseManager?.deleteGlobalData(key)
                         }
                     }
@@ -1210,9 +1733,9 @@ object MenuActions {
                     val value = args[1]
                     if (asyncDataOperations) {
                         // 异步执行数据库操作，避免阻塞主线程
-                        plugin?.let { Bukkit.getScheduler().runTaskAsynchronously(it, Runnable {
+                        KaScheduler.runAsync(Runnable {
                             databaseManager?.setGlobalData(key, value)
-                        })}
+                        })
                     } else {
                         // 同步执行数据库操作，确保数据在菜单渲染前完成
                         databaseManager?.setGlobalData(key, value)
@@ -1233,7 +1756,7 @@ object MenuActions {
             // toast: 显示 Toast 通知
             finalCmd.startsWith("toast:") -> {
                 val args = finalCmd.removePrefix("toast:").trim()
-                Bukkit.getScheduler().runTask(plugin ?: return, Runnable {
+                KaScheduler.runPlayer(player, Runnable {
                     ActionHandlers.parseAndSendToast(player, args)
                 })
             }
@@ -1241,15 +1764,35 @@ object MenuActions {
             // money: 操作玩家金币
             finalCmd.startsWith("money:") -> {
                 val args = finalCmd.removePrefix("money:").trim()
-                Bukkit.getScheduler().runTask(plugin ?: return, Runnable {
+                KaScheduler.runPlayer(player, Runnable {
                     ActionHandlers.parseAndHandleMoney(player, args, variables)
+                })
+            }
+
+            // points: 使用 PlayerPoints 增减点券
+            finalCmd.startsWith("points:") -> {
+                val args = finalCmd.removePrefix("points:").trim()
+                KaScheduler.runPlayer(player, Runnable {
+                    ActionHandlers.parseAndHandlePoints(player, args, variables)
+                })
+            }
+
+            // add-points/take-points 等 源菜单 兼容别名
+            pointsAlias != null -> {
+                KaScheduler.runPlayer(player, Runnable {
+                    ActionHandlers.parseAndHandlePoints(
+                        player,
+                        pointsAlias.second,
+                        variables,
+                        forcedType = pointsAlias.first
+                    )
                 })
             }
 
             // stock-item: 物品给予/扣除
             finalCmd.startsWith("stock-item:") -> {
                 val args = finalCmd.removePrefix("stock-item:").trim()
-                Bukkit.getScheduler().runTask(plugin ?: return, Runnable {
+                KaScheduler.runPlayer(player, Runnable {
                     ActionHandlers.parseAndHandleStockItem(player, args, variables)
                 })
             }
@@ -1257,7 +1800,7 @@ object MenuActions {
             // item: 普通物品给予/扣除
             finalCmd.startsWith("item:") -> {
                 val args = finalCmd.removePrefix("item:").trim()
-                Bukkit.getScheduler().runTask(plugin ?: return, Runnable {
+                KaScheduler.runPlayer(player, Runnable {
                     ActionHandlers.parseAndHandleItem(player, args, variables)
                 })
             }
@@ -1265,7 +1808,7 @@ object MenuActions {
             // server: 传送到指定服务器（支持 BungeeCord/Velocity）
             finalCmd.startsWith("server:") -> {
                 val serverName = finalCmd.removePrefix("server:").trim()
-                Bukkit.getScheduler().runTask(plugin ?: return, Runnable {
+                KaScheduler.runPlayer(player, Runnable {
                     ActionHandlers.parseAndHandleServer(player, serverName)
                 })
             }
@@ -1273,11 +1816,39 @@ object MenuActions {
             // tppos: 传送到指定坐标
             finalCmd.startsWith("tppos:") -> {
                 val args = finalCmd.removePrefix("tppos:").trim()
-                Bukkit.getScheduler().runTask(plugin ?: return, Runnable {
+                KaScheduler.runPlayer(player, Runnable {
                     ActionHandlers.parseAndHandleTppos(player, args)
                 })
             }
         }
+    }
+
+    /** 替换当前菜单参数，并按当前 UI 类型选择原地刷新或强制重开。 */
+    private fun replaceMenuArgumentsAndRefresh(
+        player: Player,
+        arguments: List<String>,
+        config: YamlConfiguration?,
+        contextId: String?,
+        handledMenuLifecycle: AtomicBoolean?
+    ) {
+        MenuArgumentManager.activate(player, arguments)
+        val kaMenu = plugin ?: return
+        val containerService = kaMenu.takeIf { it.containerMenusReady }?.containerMenuService
+        if (containerService?.currentSessionId(player) != null) {
+            containerService.refreshFromAction(player, "*")
+            return
+        }
+        if (config == null) return
+
+        handledMenuLifecycle?.set(true)
+        val menuId = kaMenu.menuManager.getMenuId(config)
+        KaScheduler.runPlayer(player, Runnable {
+            if (menuId != null) {
+                MenuUI.forceOpenMenu(player, menuId, kaMenu.menuManager, kaMenu, arguments)
+            } else {
+                MenuUI.forceOpenConfig(player, config, kaMenu, contextId ?: "external", arguments)
+            }
+        })
     }
 
     /**
@@ -1288,21 +1859,28 @@ object MenuActions {
      */
     fun executeTestAction(player: Player, actionString: String): Boolean {
         if (plugin == null) {
-            player.sendMessage(TextParser.parseText(languageManager?.getMessage("actions.test_failed", "插件未初始化") ?: "§c插件未初始化，无法执行动作"))
+            MenuUI.sendMessage(player, TextParser.parseText(languageManager?.getMessage("actions.test_failed", "插件未初始化") ?: "§c插件未初始化，无法执行动作"))
             return false
         }
 
         try {
             val menuOpener: (Player, String) -> Unit = { p, menuName ->
-                Bukkit.getScheduler().runTask(plugin!!, Runnable {
+                KaScheduler.runPlayer(p, Runnable {
                     MenuUI.openMenu(p, menuName, plugin!!.menuManager, plugin!!)
                 })
             }
 
-            executeSingleAction(player, actionString, emptyMap(), menuOpener, null)
+            executeActionList(
+                player,
+                listOf(actionString),
+                emptyMap(),
+                menuOpener,
+                config = null,
+                asyncDataOperations = true
+            )
             return true
         } catch (e: Exception) {
-            player.sendMessage(TextParser.parseText(e.message?.let { languageManager?.getMessage("actions.test_failed", it) } ?: "§c动作执行失败: ${e.message}"))
+            MenuUI.sendMessage(player, TextParser.parseText(e.message?.let { languageManager?.getMessage("actions.test_failed", it) } ?: "§c动作执行失败: ${e.message}"))
             plugin?.logger?.severe("测试动作执行失败: ${e.message}")
             e.printStackTrace()
             return false
@@ -1311,7 +1889,7 @@ object MenuActions {
 
     /**
      * 解析可点击文本 (使用 Adventure API)
-     * 格式: <text='显示文字';hover='悬停文字';command='指令';url='链接';newline='false';actions='动作列表路径'>
+     * 格式: <text='显示文字';hover='悬停文字';hover_item='物品来源';actions='动作列表路径';copy='复制文本';command='指令';url='链接';newline='false'>
      * 注意: 只有包含 text= 参数的标签才会被解析为可点击文本，其他的 <...> 标签会被保留给 MiniMessage 处理
      */
     fun parseClickableText(rawText: String): Component {
@@ -1320,7 +1898,7 @@ object MenuActions {
 
     /**
      * 解析可点击文本 (使用 Adventure API) - 带上下文版本
-     * 格式: <text='显示文字';hover='悬停文字';command='指令';url='链接';newline='false';actions='动作列表路径'>
+     * 格式: <text='显示文字';hover='悬停文字';actions='动作列表路径';copy='复制文本';command='指令';url='链接';newline='false'>
      * 注意: 只有包含 text= 参数的标签才会被解析为可点击文本，其他的 <...> 标签会被保留给 MiniMessage 处理
      * @param rawText 原始文本
      * @param player 玩家对象（用于 actions 回调）
@@ -1333,6 +1911,7 @@ object MenuActions {
         config: YamlConfiguration?,
         menuOpener: ((Player, String) -> Unit)?
     ): Component {
+        val forceOraxenResolver = OraxenTextAdapter.containsGlyphTag(rawText)
         val replacements = mutableListOf<Pair<IntRange, Component>>()
         var currentPos = 0
 
@@ -1361,7 +1940,7 @@ object MenuActions {
 
         // 如果没有 hovertext，直接用 parseText 处理 MiniMessage
         if (replacements.isEmpty()) {
-            return TextParser.parseText(rawText)
+            return TextParser.parseText(rawText, player, forceOraxenResolver)
         }
 
         // 按位置升序排序，从前往后处理
@@ -1374,7 +1953,7 @@ object MenuActions {
         replacements.forEach { (range, component) ->
             // 添加 hovertext 之前的文本（包含 MiniMessage）
             if (range.first > lastEnd) {
-                mainBuilder.append(TextParser.parseText(rawText.substring(lastEnd, range.first)))
+                mainBuilder.append(TextParser.parseText(rawText.substring(lastEnd, range.first), player, forceOraxenResolver))
             }
             // 添加 hovertext 组件
             mainBuilder.append(component)
@@ -1383,7 +1962,7 @@ object MenuActions {
 
         // 添加最后剩余的文本
         if (lastEnd < rawText.length) {
-            mainBuilder.append(TextParser.parseText(rawText.substring(lastEnd)))
+            mainBuilder.append(TextParser.parseText(rawText.substring(lastEnd), player, forceOraxenResolver))
         }
 
         return mainBuilder.build()
@@ -1426,7 +2005,9 @@ object MenuActions {
     ): Component? {
         var text = ""
         var hover = ""
+        var hoverItem = ""
         var command = ""
+        var copy = ""
         var url = ""
         var actions = ""
         var newline = false
@@ -1447,7 +2028,9 @@ object MenuActions {
                         hasTextParam = true
                     }
                     "hover" -> hover = value.removeSurrounding("`").removeSurrounding("'").removeSurrounding("\"")
+                    "hover_item", "hover-item" -> hoverItem = value.removeSurrounding("`").removeSurrounding("'").removeSurrounding("\"")
                     "command" -> command = value.removeSurrounding("`").removeSurrounding("'").removeSurrounding("\"")
+                    "copy" -> copy = value.removeSurrounding("`").removeSurrounding("'").removeSurrounding("\"")
                     "url" -> url = value.removeSurrounding("`").removeSurrounding("'").removeSurrounding("\"")
                     "actions" -> actions = value.removeSurrounding("`").removeSurrounding("'").removeSurrounding("\"")
                     "newline" -> newline = value.removeSurrounding("`").removeSurrounding("'").removeSurrounding("\"").equals("true", ignoreCase = true)
@@ -1457,10 +2040,79 @@ object MenuActions {
 
         // 只有包含 text= 参数且 text 不为空时才返回组件
         return if (hasTextParam && text.isNotEmpty()) {
-            createAdventureClickableText(text, hover, command, url, actions, newline, player, config, menuOpener)
+            var component = createAdventureClickableTextInternal(
+                text,
+                hover,
+                command,
+                copy,
+                url,
+                actions,
+                newline,
+                player,
+                config,
+                menuOpener
+            )
+            if (player != null && hoverItem.isNotBlank()) {
+                resolveHoverItem(player, hoverItem)?.let { item ->
+                    component = component.hoverEvent(MenuUI.itemHover(item))
+                }
+            }
+            component
         } else {
             null
         }
+    }
+
+    /**
+     * 将可点击文本的 hover_item 来源解析为完整 ItemStack。
+     *
+     * 支持主副手、背包槽位、四个护甲槽、保存物品和基础材质；返回克隆物品，避免悬浮展示修改原物品。
+     */
+    fun resolveHoverItem(player: Player, rawSource: String): org.bukkit.inventory.ItemStack? {
+        val source = rawSource.trim()
+        val lowerSource = source.lowercase()
+        val item = when {
+            lowerSource == "hand" || lowerSource == "mainhand" || lowerSource == "main_hand" ->
+                player.inventory.itemInMainHand
+
+            lowerSource == "offhand" || lowerSource == "off_hand" ->
+                player.inventory.itemInOffHand
+
+            lowerSource == "helmet" || lowerSource == "head" || lowerSource == "armor:helmet" ->
+                player.inventory.helmet
+
+            lowerSource == "chestplate" || lowerSource == "chest" || lowerSource == "armor:chestplate" ->
+                player.inventory.chestplate
+
+            lowerSource == "leggings" || lowerSource == "legs" || lowerSource == "armor:leggings" ->
+                player.inventory.leggings
+
+            lowerSource == "boots" || lowerSource == "feet" || lowerSource == "armor:boots" ->
+                player.inventory.boots
+
+            lowerSource.startsWith("slot:") -> {
+                val slot = source.substringAfter(':').trim().toIntOrNull()
+                slot?.takeIf { it in 0 until player.inventory.size }
+                    ?.let { player.inventory.getItem(it) }
+            }
+
+            lowerSource.startsWith("stock:") -> {
+                val itemName = source.substringAfter(':').trim()
+                itemName.takeIf { it.isNotEmpty() }?.let { itemManager?.getItem(it) }
+            }
+
+            lowerSource.startsWith("material:") -> {
+                val materialName = source.substringAfter(':').trim()
+                ExternalItemAdapter.create(materialName, player = player)
+                    ?: MaterialUtils.matchMaterial(materialName)?.let { org.bukkit.inventory.ItemStack(it) }
+            }
+
+            else -> ExternalItemAdapter.create(source, player = player)
+        }
+
+        return item
+            ?.takeIf { it.amount > 0 && !it.type.isAir }
+            ?.clone()
     }
 
     /**
@@ -1485,8 +2137,33 @@ object MenuActions {
         player: Player? = null,
         config: YamlConfiguration? = null,
         menuOpener: ((Player, String) -> Unit)? = null
+    ): Component = createAdventureClickableTextInternal(
+        text,
+        hoverText,
+        command,
+        "",
+        url,
+        actions,
+        newline,
+        player,
+        config,
+        menuOpener
+    )
+
+    /** 创建包含 copy 点击行为的可点击文本，并统一处理互斥点击动作。 */
+    private fun createAdventureClickableTextInternal(
+        text: String,
+        hoverText: String,
+        command: String,
+        copy: String,
+        url: String,
+        actions: String,
+        newline: Boolean,
+        player: Player?,
+        config: YamlConfiguration?,
+        menuOpener: ((Player, String) -> Unit)?
     ): Component {
-        var component = TextParser.parseText(text)
+        var component = TextParser.parseText(text, player)
 
         // 添加点击事件
         if (actions.isNotEmpty()) {
@@ -1495,41 +2172,37 @@ object MenuActions {
                 component = component.clickEvent(ClickEvent.callback({ audience ->
                     if (audience is Player) {
                         val actionCall = parseActionCall(actions)
-                        // 从 Events.Click 加载动作列表
-                        val actionPath = "Events.Click.${actionCall.name}"
-                        val actionList = config.getList(actionPath)
+                        val actionList = findActionList(config, actionCall.name)
 
-                        if (actionList != null && actionList.isNotEmpty()) {
-                            // 异步执行动作列表
-                            plugin?.let {
-                                Bukkit.getScheduler().runTaskAsynchronously(it, Runnable {
-                                    executeActionList(
-                                        audience,
-                                        actionList.map { it ?: Any() },
-                                        mergeActionArguments(emptyMap(), actionCall.arguments),
-                                        menuOpener,
-                                        0L,
-                                        config
-                                    )
-                                })
-                            }
+                        if (actionList != null) {
+                            KaScheduler.runPlayer(audience, Runnable {
+                                executeActionList(
+                                    audience,
+                                    actionList.actions,
+                                    mergeActionArguments(emptyMap(), actionCall.arguments),
+                                    menuOpener,
+                                    0L,
+                                    config,
+                                    actionListId = actionList.id
+                                )
+                            })
                         } else {
-                            audience.sendMessage(TextParser.parseText(plugin?.languageManager?.getMessage("actions.action_list_not_found", actionCall.name)))
+                            MenuUI.sendMessage(audience, TextParser.parseText(actionListNotFoundMessage(actionCall.name, config)))
                         }
                     }
-                }, ClickCallback.Options.builder()
-                    .lifetime(Duration.ofMinutes(5))
-                    .build()))
+                }, buildCallbackOptions(config)))
             }
-        } else if (url.isNotEmpty()) {
-            component = component.clickEvent(ClickEvent.openUrl(url))
+        } else if (copy.isNotEmpty()) {
+            component = component.clickEvent(ClickEvent.copyToClipboard(copy))
         } else if (command.isNotEmpty()) {
             component = component.clickEvent(ClickEvent.runCommand(command))
+        } else if (url.isNotEmpty()) {
+            component = component.clickEvent(ClickEvent.openUrl(url))
         }
 
         // 添加悬停事件
         if (hoverText.isNotEmpty()) {
-            component = component.hoverEvent(net.kyori.adventure.text.event.HoverEvent.showText(TextParser.parseText(hoverText)))
+            component = component.hoverEvent(net.kyori.adventure.text.event.HoverEvent.showText(TextParser.parseText(hoverText, player)))
         }
 
         // 添加换行

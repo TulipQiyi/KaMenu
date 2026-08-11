@@ -3,8 +3,10 @@ package org.katacr.kamenu
 import org.bukkit.Material
 
 /**
- * 物品材质工具类
- * 用于处理材质名称的规范化匹配
+ * 物品材质工具类。
+ *
+ * 统一把用户输入的材质名规范化为 Bukkit Material 可识别的格式，
+ * 并提供 Dialog 文本中使用的 sprite 标签转换。
  */
 object MaterialUtils {
 
@@ -40,17 +42,20 @@ object MaterialUtils {
      * 规范化材质名称
      * 1. 转换为大写
      * 2. 将短杠、空格替换为下划线
+     * 3. 移除原版 minecraft 命名空间
      *
      * @param materialName 原始材质名称
      * @return 规范化后的材质名称
      */
     fun normalizeMaterialName(materialName: String): String {
-        return materialName
+        val normalized = materialName
             .uppercase()                          // 转换为大写
             .replace("-", "_")                      // 将短杠替换为下划线
             .replace(" ", "_")                     // 将空格替换为下划线
             .replace(Regex("_+"), "_")            // 合并多个下划线
             .trim()                               // 去除首尾空白
+
+        return normalized.removePrefix("MINECRAFT:")
     }
 
     /**
@@ -69,7 +74,7 @@ object MaterialUtils {
         val material = matchMaterial(materialName) ?: return null
 
         // MiniMessage sprite 标签需要小写
-        val key = material.key.value().lowercase()
+        val key = material.key.key.lowercase()
         return if (material.isBlock) {
             "<sprite:blocks:block/$key>"
         } else {

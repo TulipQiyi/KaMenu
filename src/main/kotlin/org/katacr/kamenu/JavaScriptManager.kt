@@ -1,22 +1,132 @@
 package org.katacr.kamenu
 
 import org.bukkit.Bukkit
+import org.bukkit.entity.Player
 import org.bukkit.plugin.java.JavaPlugin
+import javax.script.Bindings
+import javax.script.Compilable
 import javax.script.ScriptEngine
 import javax.script.ScriptException
 
 /**
- * JavaScript 支持管理器
- * 内嵌 Nashorn JavaScript 引擎
+ * JavaScript 支持管理器。
+ *
+ * 内嵌 Nashorn 引擎，负责执行菜单内 `JavaScript` 代码块、全局 js 文件包和 `{js:...}` 内联表达式。
+ *
+ * 线程模型：Nashorn 引擎实例共享，但每次执行都会创建独立 Bindings，并通过锁串行进入引擎。
+ * 这样可以避免两个玩家同时执行脚本时覆盖 `player`、`args` 等上下文变量。
  */
 object JavaScriptManager {
     private var scriptEngine: ScriptEngine? = null
     private var available = false
     private var plugin: JavaPlugin? = null
+    private var packageManager: JavaScriptPackageManager? = null
     private val scriptLock = Any()
+    /**
+     * 注入到每次脚本执行上下文的辅助函数。
+     *
+     * 这些函数是菜单作者可直接调用的 JS API，例如 `papi()`、`kvar()`、`data()`、`gdata()`。
+     */
+    private val helperScript = """
+        var Bukkit = Java.type("org.bukkit.Bukkit");
+        var JavaLong = Java.type("java.lang.Long");
+        var JavaRunnable = Java.type("java.lang.Runnable");
+
+        function __kamenu_target_player(targetPlayer) {
+            return targetPlayer || (typeof player !== "undefined" ? player : null);
+        }
+
+        function __kamenu_delay_ticks(ticks) {
+            var value = Number(ticks);
+            if (isNaN(value) || value < 0) {
+                value = 0;
+            }
+            return JavaLong.valueOf(Math.floor(value));
+        }
+
+        function __kamenu_runnable(callback) {
+            var RunnableAdapter = Java.extend(JavaRunnable, {
+                run: function() {
+                    callback();
+                }
+            });
+            return new RunnableAdapter();
+        }
+
+        function tell(targetPlayer, message) {
+            if (targetPlayer && targetPlayer.sendMessage) {
+                targetPlayer.sendMessage(message);
+            }
+        }
+
+        function log(message) {
+            print("[JS] " + message);
+        }
+
+        function delay(ticks, callback) {
+            return __kamenu_js_manager.delay(__kamenu_target_player(null), __kamenu_delay_ticks(ticks), __kamenu_runnable(callback));
+        }
+
+        function asyncDelay(ticks, callback) {
+            return __kamenu_js_manager.asyncDelay(__kamenu_delay_ticks(ticks), __kamenu_runnable(callback));
+        }
+
+        function getPlayer(name) {
+            return Bukkit.getPlayer(name);
+        }
+
+        function papi(placeholder, targetPlayer) {
+            return __kamenu_js_manager.resolvePapi(__kamenu_target_player(targetPlayer), String(placeholder));
+        }
+
+        function vars(text, targetPlayer) {
+            var menuConfig = typeof __kamenu_menu_config !== "undefined" ? __kamenu_menu_config : null;
+            return __kamenu_js_manager.resolveText(
+                __kamenu_target_player(targetPlayer),
+                String(text),
+                menuConfig
+            );
+        }
+
+        function kvar(variable, targetPlayer) {
+            return __kamenu_js_manager.resolveKaMenuVariable(__kamenu_target_player(targetPlayer), String(variable));
+        }
+
+        function data(key, targetPlayer) {
+            return kvar("data:" + key, targetPlayer);
+        }
+
+        function gdata(key, targetPlayer) {
+            return kvar("gdata:" + key, targetPlayer);
+        }
+
+        function meta(key, targetPlayer) {
+            return kvar("meta:" + key, targetPlayer);
+        }
+
+        function list(key, targetPlayer) {
+            return kvar("list:" + key, targetPlayer);
+        }
+
+        function glist(key, targetPlayer) {
+            return kvar("glist:" + key, targetPlayer);
+        }
+    """.trimIndent()
 
     /**
-     * 初始化 JavaScript 支持
+     * JS 源码来源。
+     *
+     * label 用于错误日志，让用户能区分菜单内脚本和全局 js 包。
+     */
+    private data class ScriptSource(
+        val code: String,
+        val label: String
+    )
+
+    /**
+     * 初始化 JavaScript 支持。
+     *
+     * 只在插件启动或 reinitialize 时调用。这里会反射加载 Nashorn，避免服务器缺少库时直接类加载失败。
      */
     fun initialize(plugin: JavaPlugin) {
         this.plugin = plugin
@@ -35,14 +145,14 @@ object JavaScriptManager {
                 // 绑定一些常用的全局变量
                 setupGlobalVariables()
             } else {
-                plugin.logger.warning("Nashorn engine not found, JavaScript features will be unavailable")
-                plugin.logger.info("Please wait for the Nashorn library to download...")
+                warn("javascript.nashorn_engine_not_found")
+                info("javascript.wait_library_download")
             }
         } catch (e: ClassNotFoundException) {
-            plugin.logger.warning("Nashorn library not loaded yet, JavaScript features will be unavailable")
-            plugin.logger.info("Please restart the server after the initial setup completes")
+            warn("javascript.nashorn_library_not_loaded")
+            info("javascript.restart_after_setup")
         } catch (e: Exception) {
-            plugin.logger.warning("Failed to initialize JavaScript support: ${e.message}")
+            warn("javascript.initialize_failed", e.message ?: e.javaClass.simpleName)
             e.printStackTrace()
         }
     }
@@ -53,52 +163,9 @@ object JavaScriptManager {
     private fun setupGlobalVariables() {
         if (scriptEngine == null) return
 
-        // 绑定 Bukkit 相关对象
+        // 仅保留兼容性全局对象。实际脚本执行会使用独立 Bindings 注入上下文和辅助函数。
         scriptEngine!!.put("server", Bukkit.getServer())
-
-        // 添加一些实用函数
-        scriptEngine!!.eval("""
-            // 发送消息给玩家
-            function tell(player, message) {
-                if (player && player.sendMessage) {
-                    player.sendMessage(message);
-                }
-            }
-            
-            // 打印日志
-            function log(message) {
-                print("[JS] " + message);
-            }
-            
-            // 延迟执行
-            function delay(ticks, callback) {
-                var task;
-                var runnable = {
-                    run: function() {
-                        callback();
-                    }
-                };
-                task = Bukkit.getScheduler().runTaskLater(null, runnable, ticks);
-                return task;
-            }
-            
-            // 异步延迟执行
-            function asyncDelay(ticks, callback) {
-                var task;
-                var runnable = {
-                    run: function() {
-                        callback();
-                    }
-                };
-                task = Bukkit.getScheduler().runTaskLaterAsynchronously(null, runnable, ticks);
-                return task;
-            }
-            
-            // 获取玩家
-            function getPlayer(name) {
-                return Bukkit.getPlayer(name);
-            }
-        """)
+        scriptEngine!!.put("__kamenu_js_manager", this)
     }
 
     /**
@@ -107,7 +174,61 @@ object JavaScriptManager {
     fun isAvailable(): Boolean = available
 
     /**
-     * 执行 JavaScript 代码
+     * JavaScript `delay()` 的调度实现。
+     *
+     * 有玩家上下文时在玩家 EntityScheduler 中延迟执行；无玩家上下文时退回全局调度。
+     */
+    fun delay(targetPlayer: Player?, ticks: Long, callback: Runnable): KaTaskHandle {
+        return if (targetPlayer != null) {
+            KaScheduler.runPlayerLater(targetPlayer, ticks, callback)
+        } else {
+            KaScheduler.runGlobalLater(ticks, callback)
+        }
+    }
+
+    /**
+     * JavaScript `asyncDelay()` 的调度实现。
+     */
+    fun asyncDelay(ticks: Long, callback: Runnable): KaTaskHandle {
+        return KaScheduler.runAsyncLater(ticks, callback)
+    }
+
+    /**
+     * 绑定全局 JS 包管理器。
+     */
+    fun setPackageManager(manager: JavaScriptPackageManager) {
+        packageManager = manager
+    }
+
+    /**
+     * 校验 JavaScript 语法，不执行脚本，避免包加载阶段触发副作用。
+     * @return null 表示语法可编译；非 null 为错误原因。
+     */
+    fun validateSyntax(script: String): String? {
+        if (!available || scriptEngine == null) {
+            return "JavaScript engine is not available"
+        }
+
+        val compilable = scriptEngine as? Compilable
+            ?: return "JavaScript engine does not support syntax compilation"
+
+        return synchronized(scriptLock) {
+            try {
+                compilable.compile(buildScript(script))
+                null
+            } catch (e: ScriptException) {
+                e.message ?: e.javaClass.simpleName
+            } catch (e: Exception) {
+                e.message ?: e.javaClass.simpleName
+            }
+        }
+    }
+
+    /**
+     * 执行不带玩家上下文的 JavaScript 代码。
+     *
+     * 一般只用于调试或兼容旧调用；菜单动作更常用 [evaluateWithContext]。
+     *
      * @return 执行结果，如果失败返回 null
      */
     fun evaluate(script: String): Any? {
@@ -117,12 +238,12 @@ object JavaScriptManager {
 
         return synchronized(scriptLock) {
             try {
-                scriptEngine!!.eval(script)
+                scriptEngine!!.eval(buildScript(script), createBindings())
             } catch (e: ScriptException) {
-                plugin?.logger?.warning("JavaScript execution error: ${e.message}")
+                warn("javascript.execution_error", e.message ?: e.javaClass.simpleName)
                 null
             } catch (e: Exception) {
-                plugin?.logger?.warning("JavaScript error: ${e.message}")
+                warn("javascript.error", e.message ?: e.javaClass.simpleName)
                 null
             }
         }
@@ -143,6 +264,95 @@ object JavaScriptManager {
     }
 
     /**
+     * JS 辅助 API：解析 PAPI 变量。
+     *
+     * 脚本内可写 `papi("player_name")` 或 `papi("%player_name%")`。
+     */
+    fun resolvePapi(player: org.bukkit.entity.Player?, placeholder: String?): String {
+        if (player == null || placeholder.isNullOrBlank()) {
+            return ""
+        }
+        if (!Bukkit.getPluginManager().isPluginEnabled("PlaceholderAPI")) {
+            return ""
+        }
+
+        val normalized = placeholder.trim().let {
+            if (it.startsWith("%") && it.endsWith("%")) it else "%$it%"
+        }
+
+        return try {
+            me.clip.placeholderapi.PlaceholderAPI.setPlaceholders(player, normalized)
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    /**
+     * JS helper：解析一段同时包含 PAPI、KaMenu 变量和菜单 JavaScript 调用的文本。
+     *
+     * 该入口主要供迁移后的 源菜单 `vars(...)` 使用；只执行 KaMenu 已有文本解析流程。
+     */
+    fun resolveText(
+        player: org.bukkit.entity.Player?,
+        text: String?,
+        menuConfig: org.bukkit.configuration.file.YamlConfiguration?
+    ): String {
+        if (player == null || text == null) {
+            return ""
+        }
+        return TextResolver.resolve(player, text, menuConfig = menuConfig)
+    }
+
+    /**
+     * JS 辅助 API：解析 KaMenu 内置变量。
+     *
+     * 脚本内可写 `kvar("gdata:key")`、`data("coins")`、`glist("players")`。
+     */
+    fun resolveKaMenuVariable(player: org.bukkit.entity.Player?, variable: String?): String {
+        if (player == null || variable.isNullOrBlank()) {
+            return ""
+        }
+
+        val trimmed = variable.trim()
+        val expression = if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            trimmed
+        } else {
+            "{$trimmed}"
+        }
+
+        return try {
+            TextResolver.resolve(player, expression)
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    /**
+     * 将 JSON 文本转成 Nashorn/Java 可遍历对象。
+     *
+     * repeat source 会用它把 JS 或变量返回的 JSON 数组转换为按钮列表。
+     */
+    fun parseJsonCompatible(json: String): Any? {
+        if (!available || scriptEngine == null || json.isBlank()) {
+            return null
+        }
+
+        return synchronized(scriptLock) {
+            try {
+                val bindings = createBindings()
+                bindings["__kamenu_json_input"] = json
+                scriptEngine!!.eval("Java.asJSONCompatible(JSON.parse(__kamenu_json_input))", bindings)
+            } catch (e: ScriptException) {
+                warn("javascript.json_parse_error", e.message ?: e.javaClass.simpleName)
+                null
+            } catch (e: Exception) {
+                warn("javascript.json_parse_error", e.message ?: e.javaClass.simpleName)
+                null
+            }
+        }
+    }
+
+    /**
      * 为特定执行绑定玩家上下文
      * @param player 玩家对象
      * @param script 要执行的脚本
@@ -155,29 +365,13 @@ object JavaScriptManager {
 
         return synchronized(scriptLock) {
             try {
-                // 绑定玩家相关的变量
-                putVariable("player", player)
-                putVariable("uuid", player.uniqueId.toString())
-                putVariable("name", player.name)
-                putVariable("location", player.location)
-                putVariable("inventory", player.inventory)
-                putVariable("world", player.world)
-
-                scriptEngine!!.eval(script)
+                scriptEngine!!.eval(buildScript(script), createBindings(player))
             } catch (e: ScriptException) {
-                plugin?.logger?.warning("JavaScript execution error for player ${player.name}: ${e.message}")
+                warn("javascript.execution_error_player", player.name, e.message ?: e.javaClass.simpleName)
                 null
             } catch (e: Exception) {
-                plugin?.logger?.warning("JavaScript error for player ${player.name}: ${e.message}")
+                warn("javascript.error_player", player.name, e.message ?: e.javaClass.simpleName)
                 null
-            } finally {
-                // 清理绑定的变量
-                putVariable("player", null)
-                putVariable("uuid", null)
-                putVariable("name", null)
-                putVariable("location", null)
-                putVariable("inventory", null)
-                putVariable("world", null)
             }
         }
     }
@@ -197,7 +391,7 @@ object JavaScriptManager {
      * 执行预定义的 JavaScript 代码块（带参数）
      * @param player 玩家对象
      * @param functionName 函数名（不带方括号）
-     * @param argsString 参数字符串（空格分隔）
+     * @param argsString 参数字符串（支持空格或英文逗号分隔）
      * @param menuConfig 菜单配置（用于读取 JavaScript 部分）
      * @return 执行结果
      */
@@ -205,79 +399,138 @@ object JavaScriptManager {
         player: org.bukkit.entity.Player,
         functionName: String,
         argsString: String,
-        menuConfig: org.bukkit.configuration.file.YamlConfiguration
+        menuConfig: org.bukkit.configuration.file.YamlConfiguration?
+    ): Any? {
+        return executePredefinedFunctionWithArgs(
+            player,
+            functionName,
+            ActionArgumentParser.splitArguments(argsString),
+            menuConfig
+        )
+    }
+
+    /**
+     * 执行预定义 JavaScript 代码块。
+     *
+     * 查找顺序固定为：菜单内 `JavaScript.<name>` 优先，全局 `js/<name>.js` 其次。
+     * 参数会注入为 JS 数组 `args`。
+     */
+    fun executePredefinedFunctionWithArgs(
+        player: org.bukkit.entity.Player,
+        functionName: String,
+        args: List<String>,
+        menuConfig: org.bukkit.configuration.file.YamlConfiguration?
     ): Any? {
         if (!available || scriptEngine == null) {
             return null
         }
 
-        // 解析参数（如果有）
-        val args = if (argsString.isEmpty()) {
-            emptyList()
-        } else {
-            argsString.trim().split("\\s+".toRegex())
-        }
-
-        // 从菜单配置中读取 JavaScript 部分
-        val jsSection = menuConfig.getConfigurationSection("JavaScript")
-        if (jsSection == null) {
-            plugin?.logger?.warning("JavaScript section not found in menu config")
+        val source = findScriptSource(functionName, menuConfig)
+        if (source == null) {
+            val checked = if (menuConfig == null) {
+                "global js/$functionName.js"
+            } else {
+                "menu JavaScript.$functionName and global js/$functionName.js"
+            }
+            warn("javascript.package_not_found", functionName, checked)
             return null
         }
 
-        val jsCode = jsSection.getString(functionName)
-        if (jsCode == null) {
-            plugin?.logger?.warning("JavaScript function '$functionName' not found")
-            return null
+        return evaluateWithContext(player, source.code, args, source.label, menuConfig)
+    }
+
+    private fun findScriptSource(
+        functionName: String,
+        menuConfig: org.bukkit.configuration.file.YamlConfiguration?
+    ): ScriptSource? {
+        val menuScript = menuConfig
+            ?.getConfigurationSection("JavaScript")
+            ?.getString(functionName)
+        if (menuScript != null) {
+            return ScriptSource(menuScript, "menu JavaScript.$functionName")
         }
 
+        val globalScript = packageManager?.getScript(functionName) ?: return null
+        return ScriptSource(globalScript, "global js/$functionName.js")
+    }
+
+    private fun evaluateWithContext(
+        player: org.bukkit.entity.Player,
+        script: String,
+        args: List<String>,
+        sourceLabel: String,
+        menuConfig: org.bukkit.configuration.file.YamlConfiguration?
+    ): Any? {
         return synchronized(scriptLock) {
             try {
-                // 绑定玩家相关的变量
-                putVariable("player", player)
-                putVariable("uuid", player.uniqueId.toString())
-                putVariable("name", player.name)
-                putVariable("location", player.location)
-                putVariable("inventory", player.inventory)
-                putVariable("world", player.world)
-
-                // 预处理参数：创建 JavaScript 数组并绑定
-                val argsArrayJs = if (args.isEmpty()) {
-                    "[]"
-                } else {
-                    args.joinToString(", ", "[", "]") { arg ->
-                        // 转义 JavaScript 字符串中的特殊字符
-                        val escaped = arg
-                            .replace("\\", "\\\\")  // 反斜杠
-                            .replace("\"", "\\\"")   // 双引号
-                            .replace("\n", "\\n")    // 换行
-                            .replace("\r", "\\r")    // 回车
-                            .replace("\t", "\\t")    // 制表符
-                        "\"$escaped\""
-                    }
-                }
-
-                // 将 args 绑定为 JavaScript 数组
-                scriptEngine!!.eval("var args = $argsArrayJs;")
-
-                // 只执行指定的 JavaScript 代码块
-                scriptEngine!!.eval(jsCode)
+                scriptEngine!!.eval(buildScript(script, args), createBindings(player, menuConfig))
             } catch (e: ScriptException) {
-                plugin?.logger?.warning("JavaScript execution error for function '$functionName': ${e.message}")
+                warn("javascript.execution_error_source_player", sourceLabel, player.name, e.message ?: e.javaClass.simpleName)
                 null
             } catch (e: Exception) {
-                plugin?.logger?.warning("JavaScript error for function '$functionName': ${e.message}")
+                warn("javascript.error_source_player", sourceLabel, player.name, e.message ?: e.javaClass.simpleName)
                 null
-            } finally {
-                // 清理绑定的变量
-                putVariable("player", null)
-                putVariable("uuid", null)
-                putVariable("name", null)
-                putVariable("location", null)
-                putVariable("inventory", null)
-                putVariable("world", null)
             }
         }
+    }
+
+    /**
+     * 创建单次脚本执行的独立变量表。
+     *
+     * 不复用全局 Bindings，避免不同玩家同时执行脚本时互相覆盖上下文。
+     */
+    private fun createBindings(
+        player: org.bukkit.entity.Player? = null,
+        menuConfig: org.bukkit.configuration.file.YamlConfiguration? = null
+    ): Bindings {
+        val bindings = scriptEngine!!.createBindings()
+        bindings["server"] = Bukkit.getServer()
+        bindings["__kamenu_js_manager"] = this
+        bindings["__kamenu_plugin"] = plugin
+        bindings["__kamenu_menu_config"] = menuConfig
+
+        if (player != null) {
+            bindings["player"] = player
+            bindings["uuid"] = player.uniqueId.toString()
+            bindings["name"] = player.name
+            bindings["location"] = player.location
+            bindings["inventory"] = player.inventory
+            bindings["world"] = player.world
+        }
+
+        return bindings
+    }
+
+    private fun buildScript(script: String, args: List<String> = emptyList()): String {
+        return "var args = ${toJavaScriptArray(args)};\n$helperScript\n$script"
+    }
+
+    private fun toJavaScriptArray(args: List<String>): String {
+        if (args.isEmpty()) {
+            return "[]"
+        }
+
+        return args.joinToString(", ", "[", "]") { arg ->
+            val escaped = arg
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t")
+            "\"$escaped\""
+        }
+    }
+
+    private fun warn(key: String, vararg args: String) {
+        val message = (plugin as? KaMenu)?.languageManager?.getMessage(key, *args)
+            ?: "$key: ${args.joinToString(", ")}"
+        plugin?.logger?.warning(message)
+    }
+
+    private fun info(key: String, vararg args: String) {
+        val message = (plugin as? KaMenu)?.languageManager?.getMessage(key, *args)
+            ?: "$key: ${args.joinToString(", ")}"
+        plugin?.logger?.info(message)
     }
 
     /**
@@ -296,36 +549,7 @@ object JavaScriptManager {
             return null
         }
 
-        // 解析函数名和参数
-        // 格式：[function_name] arg1 arg2 arg3 ...
-        val trimmed = functionName.trim()
-
-        // 检查是否是预定义函数格式 [function_name]
-        val closeBracketIndex = trimmed.indexOf(']')
-        if (!trimmed.startsWith("[") || closeBracketIndex == -1) {
-            return null
-        }
-
-        // 提取函数名（在 [ 和 ] 之间）
-        val cleanName = trimmed.substring(1, closeBracketIndex)
-
-        // 查找第一个空格的位置（在 ] 之后）
-        var firstSpaceIndex = -1
-        for (i in (closeBracketIndex + 1) until trimmed.length) {
-            if (trimmed[i].isWhitespace()) {
-                firstSpaceIndex = i
-                break
-            }
-        }
-
-        // 解析参数（如果有）
-        val argsString = if (firstSpaceIndex > closeBracketIndex) {
-            trimmed.substring(firstSpaceIndex).trim()
-        } else {
-            ""
-        }
-
-        // 调用新方法
-        return executePredefinedFunctionWithArgs(player, cleanName, argsString, menuConfig)
+        val call = ActionArgumentParser.parseBracketCall(functionName) ?: return null
+        return executePredefinedFunctionWithArgs(player, call.name, call.arguments, menuConfig)
     }
 }

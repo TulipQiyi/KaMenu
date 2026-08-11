@@ -6,13 +6,30 @@ import org.bukkit.Bukkit
 import org.bukkit.command.Command
 import org.bukkit.command.CommandMap
 import org.bukkit.command.SimpleCommandMap
+import org.bukkit.configuration.ConfigurationSection
+import org.bukkit.configuration.file.YamlConfiguration
 import java.lang.reflect.Field
 
 /**
- * 自定义指令管理器
- * 负责注册和取消注册 config.yml 中配置的自定义指令
+ * 自定义指令注册管理器。
+ *
+ * 读取插件根目录 custom_commands.yml，通过 Bukkit CommandMap 动态注册命令。
+ * 支持旧格式 `cmd: menu/id`，也支持新格式 `cmd.actions` 动作列表和 `cmd.args` 动态补全。
+ *
+ * 注销时只移除本管理器记录过的 Command 实例，避免 reload 时误删其他插件的同名命令。
  */
 class CustomCommandManager(private val plugin: KaMenu) {
+
+    /**
+     * 自定义指令注册统计。
+     *
+     * 用于 `/kamenu reload config` 显示总数、成功数和失败数。
+     */
+    data class RegistrationResult(
+        val total: Int = 0,
+        val success: Int = 0,
+        val failed: Int = 0
+    )
 
     private val registeredCommands = mutableMapOf<String, Command>()
     private var commandMap: CommandMap? = null
@@ -27,7 +44,7 @@ class CustomCommandManager(private val plugin: KaMenu) {
             knownCommandsField!!.isAccessible = true
             knownCommands = knownCommandsField!!.get(commandMap) as MutableMap<String, Command>
         } catch (e: Exception) {
-            plugin.logger.warning("Failed to initialize CustomCommandManager: ${e.message}")
+            warn("custom_commands.manager_initialize_failed", e.message ?: e.javaClass.simpleName)
         }
     }
 
@@ -42,53 +59,155 @@ class CustomCommandManager(private val plugin: KaMenu) {
     }
 
     /**
-     * 从配置文件加载并注册自定义指令
+     * 从配置文件加载并注册自定义指令。
+     *
+     * 兼容旧调用点；需要详细统计时使用 [registerCustomCommandsWithResult]。
+     *
      * @return 成功注册的指令数量
      */
     fun registerCustomCommands(): Int {
+        return registerCustomCommandsWithResult().success
+    }
+
+    /**
+     * 重新注册全部自定义指令并返回统计。
+     *
+     * 会先注销本插件上一次注册的命令，再重新读取 custom_commands.yml。
+     */
+    fun registerCustomCommandsWithResult(): RegistrationResult {
         // 先清除所有已注册的自定义指令
         unregisterAllCustomCommands()
 
-        val customCommandsSection = plugin.config.getConfigurationSection("custom-commands") ?: return 0
+        val customCommandsSection = CustomCommandFileManager
+            .load(plugin)
+            .getConfigurationSection("custom-commands")
+            ?: return RegistrationResult()
 
         // 获取所有自定义指令配置
         val commands = customCommandsSection.getKeys(false)
         if (commands.isEmpty()) {
-            return 0
+            return RegistrationResult()
         }
 
         var successCount = 0
+        var failedCount = 0
 
         commands.forEach { commandName ->
-            val menuId = customCommandsSection.getString(commandName)
-            if (menuId == null || menuId.isBlank()) {
-                return@forEach
-            }
-
-            // 检查菜单是否存在
-            if (plugin.menuManager.getMenuConfig(menuId) == null) {
+            val definition = parseCommandDefinition(customCommandsSection, commandName) ?: run {
+                warn("custom_commands.invalid_config", commandName)
+                failedCount++
                 return@forEach
             }
 
             try {
-                registerCommand(commandName, menuId)
+                registerCommand(commandName, definition)
                 successCount++
             } catch (e: Exception) {
-                // 忽略注册失败的指令
+                warn("custom_commands.register_failed", commandName, e.message ?: e.javaClass.simpleName)
+                failedCount++
             }
         }
 
-        return successCount
+        return RegistrationResult(total = commands.size, success = successCount, failed = failedCount)
+    }
+
+    /** 读取当前独立自定义指令配置，供迁移器写入后保存。 */
+    fun loadConfiguration(): YamlConfiguration = CustomCommandFileManager.load(plugin)
+
+    /** 保存自定义指令配置，并让下一次注册读取最新内容。 */
+    fun saveConfiguration(configuration: YamlConfiguration) {
+        CustomCommandFileManager.save(plugin, configuration)
     }
 
     /**
-     * 注册单个自定义指令
+     * 解析单条自定义指令配置。
+     *
+     * 支持三种形态：
+     * 1. 字符串：直接打开菜单；
+     * 2. `menu:`：打开菜单并可附带 args 补全；
+     * 3. `actions:`：执行动作列表并可读取 `{arg:0}` 等命令参数。
      */
-    private fun registerCommand(commandName: String, menuId: String) {
+    private fun parseCommandDefinition(
+        customCommandsSection: ConfigurationSection,
+        commandName: String
+    ): CustomCommandDefinition? {
+        val rawValue = customCommandsSection.get(commandName)
+
+        if (rawValue is String) {
+            val menuId = rawValue.trim()
+            if (menuId.isEmpty()) {
+                return null
+            }
+            if (plugin.menuManager.getMenuConfig(menuId) == null) {
+                warn("custom_commands.menu_not_found", commandName, menuId)
+                return null
+            }
+            return CustomCommandDefinition.OpenMenu(menuId)
+        }
+
+        val commandSection = customCommandsSection.getConfigurationSection(commandName) ?: return null
+        val argSuggestions = parseArgSuggestions(commandSection, commandName)
+
+        val menuId = commandSection.getString("menu")?.trim()
+        if (!menuId.isNullOrEmpty()) {
+            if (plugin.menuManager.getMenuConfig(menuId) == null) {
+                warn("custom_commands.menu_not_found", commandName, menuId)
+                return null
+            }
+            return CustomCommandDefinition.OpenMenu(menuId, argSuggestions)
+        }
+
+        val actions = commandSection.getList("actions") ?: return null
+        if (actions.isEmpty()) {
+            return null
+        }
+
+        return CustomCommandDefinition.RunActions(actions.map { it ?: Any() }, argSuggestions)
+    }
+
+    /**
+     * 解析命令参数补全配置。
+     *
+     * key 是从 0 开始的参数下标，value 可以是字符串、列表或变量表达式。
+     */
+    private fun parseArgSuggestions(
+        commandSection: ConfigurationSection,
+        commandName: String
+    ): Map<Int, Any> {
+        val argsSection = commandSection.getConfigurationSection("args") ?: return emptyMap()
+        val suggestions = linkedMapOf<Int, Any>()
+
+        argsSection.getKeys(false).forEach { key ->
+            val index = key.toIntOrNull()
+            if (index == null || index < 0) {
+                warn("custom_commands.invalid_args_key", commandName, key)
+                return@forEach
+            }
+
+            val value = argsSection.get(key)
+            if (value != null) {
+                suggestions[index] = value
+            }
+        }
+
+        return suggestions
+    }
+
+    private fun warn(key: String, vararg args: String) {
+        plugin.logger.warning(plugin.languageManager.getMessage(key, *args))
+    }
+
+    /**
+     * 注册单个自定义指令。
+     *
+     * CommandMap 会以 `kamenu` 作为 fallback prefix 注册，因此实际可能同时存在
+     * `commandName` 和 `kamenu:commandName` 两个入口。
+     */
+    private fun registerCommand(commandName: String, definition: CustomCommandDefinition) {
         val commandMap = this.commandMap ?: throw RuntimeException("CommandMap not initialized")
 
         // 创建自定义指令
-        val command = CustomCommand(plugin, menuId, commandName)
+        val command = CustomCommand(plugin, definition, commandName)
 
         // 注册指令
         commandMap.register("kamenu", command)
@@ -98,7 +217,9 @@ class CustomCommandManager(private val plugin: KaMenu) {
     }
 
     /**
-     * 取消注册所有自定义指令
+     * 取消注册所有自定义指令。
+     *
+     * 只移除 value 与本管理器保存的 Command 实例相同的映射，防止同名指令被其他插件接管后被误删。
      */
     fun unregisterAllCustomCommands() {
         if (registeredCommands.isEmpty()) {
@@ -106,14 +227,42 @@ class CustomCommandManager(private val plugin: KaMenu) {
         }
 
         val knownCommands = this.knownCommands ?: return
+        val commandMap = this.commandMap
 
-        registeredCommands.forEach { (commandName, _) ->
-            // 移除指令
-            knownCommands.remove(commandName)
-            knownCommands.remove("kamenu:$commandName")
+        registeredCommands.forEach { (_, command) ->
+            val keysToRemove = knownCommands
+                .filterValues { it === command }
+                .keys
+                .toList()
+
+            keysToRemove.forEach { key ->
+                knownCommands.remove(key, command)
+            }
+
+            if (commandMap != null) {
+                command.unregister(commandMap)
+            }
         }
 
         registeredCommands.clear()
+    }
+
+    /**
+     * 刷新在线玩家客户端命令树。
+     *
+     * Bukkit 动态注册或注销命令后，在线玩家客户端不会自动获得新的 Brigadier 命令树。
+     * 自定义指令重载完成后调用该方法，可让玩家不重进服务器也能立刻获得 TAB 补全。
+     */
+    fun refreshOnlinePlayerCommands() {
+        Bukkit.getOnlinePlayers().forEach { player ->
+            KaScheduler.runPlayer(player, Runnable {
+                try {
+                    player.updateCommands()
+                } catch (e: Exception) {
+                    warn("custom_commands.update_commands_failed", player.name, e.message ?: e.javaClass.simpleName)
+                }
+            })
+        }
     }
 
     /**

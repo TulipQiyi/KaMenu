@@ -6,14 +6,19 @@ import java.sql.Connection
 import java.util.*
 
 /**
- * 数据库管理器
- * 用于管理玩家数据和全局数据
+ * 数据库管理器。
+ *
+ * 负责 KaMenu 内置持久化：玩家 data/list、全局 gdata/glist、以及保存的物品。
+ * SQLite 使用单连接池以降低锁冲突，MySQL 使用较大的连接池。
+ *
+ * 菜单动作默认会异步执行写操作，避免主线程等待数据库。
  */
 class DatabaseManager(val plugin: KaMenu) {
     var dataSource: HikariDataSource? = null
+    private val listMutationLock = Any()
 
     /**
-     * 初始化数据库
+     * 初始化数据库连接池并创建表结构。
      */
     fun setup() {
         val config = HikariConfig()
@@ -38,7 +43,9 @@ class DatabaseManager(val plugin: KaMenu) {
     }
 
     /**
-     * 获取数据库连接
+     * 获取数据库连接。
+     *
+     * 调用方必须使用 `use` 关闭连接，避免连接池泄漏。
      */
     val connection: Connection
         get() = dataSource!!.connection
@@ -85,6 +92,22 @@ class DatabaseManager(val plugin: KaMenu) {
                     item_data TEXT NOT NULL,
                     saved_by VARCHAR(36),
                     update_time BIGINT
+                )
+            """)
+
+            // Container 自由槽位托管账本；物品恢复记录不能与普通 data/list 混用。
+            statement.execute("""
+                CREATE TABLE IF NOT EXISTS free_slot_escrow (
+                    session_id VARCHAR(36) NOT NULL,
+                    player_uuid VARCHAR(36) NOT NULL,
+                    menu_id VARCHAR(255) NOT NULL,
+                    menu_generation BIGINT NOT NULL,
+                    free_slot_id VARCHAR(64) NOT NULL,
+                    inventory_slot INTEGER NOT NULL,
+                    item_data TEXT NOT NULL,
+                    state VARCHAR(32) NOT NULL,
+                    update_time BIGINT NOT NULL,
+                    PRIMARY KEY (session_id, inventory_slot)
                 )
             """)
         }
@@ -155,6 +178,44 @@ class DatabaseManager(val plugin: KaMenu) {
                 return stmt.executeUpdate() > 0
             }
         }
+    }
+
+    fun getPlayerList(playerUuid: UUID, key: String): List<String> {
+        return decodeStringList(getPlayerData(playerUuid, key))
+    }
+
+    fun getPlayerListJson(playerUuid: UUID, key: String): String {
+        return encodeStringList(getPlayerList(playerUuid, key))
+    }
+
+    fun setPlayerList(playerUuid: UUID, key: String, values: List<String>) {
+        setPlayerData(playerUuid, key, encodeStringList(values))
+    }
+
+    fun addPlayerListValues(playerUuid: UUID, key: String, values: List<String>, unique: Boolean = true) {
+        if (values.isEmpty()) return
+        synchronized(listMutationLock) {
+            val current = getPlayerList(playerUuid, key).toMutableList()
+            values.forEach { value ->
+                if (!unique || !current.contains(value)) {
+                    current.add(value)
+                }
+            }
+            setPlayerList(playerUuid, key, current)
+        }
+    }
+
+    fun removePlayerListValues(playerUuid: UUID, key: String, values: List<String>) {
+        if (values.isEmpty()) return
+        synchronized(listMutationLock) {
+            val removing = values.toSet()
+            val current = getPlayerList(playerUuid, key).filterNot { it in removing }
+            setPlayerList(playerUuid, key, current)
+        }
+    }
+
+    fun clearPlayerList(playerUuid: UUID, key: String) {
+        setPlayerList(playerUuid, key, emptyList())
     }
 
     /**
@@ -321,6 +382,44 @@ class DatabaseManager(val plugin: KaMenu) {
         }
     }
 
+    fun getGlobalList(key: String): List<String> {
+        return decodeStringList(getGlobalData(key))
+    }
+
+    fun getGlobalListJson(key: String): String {
+        return encodeStringList(getGlobalList(key))
+    }
+
+    fun setGlobalList(key: String, values: List<String>) {
+        setGlobalData(key, encodeStringList(values))
+    }
+
+    fun addGlobalListValues(key: String, values: List<String>, unique: Boolean = true) {
+        if (values.isEmpty()) return
+        synchronized(listMutationLock) {
+            val current = getGlobalList(key).toMutableList()
+            values.forEach { value ->
+                if (!unique || !current.contains(value)) {
+                    current.add(value)
+                }
+            }
+            setGlobalList(key, current)
+        }
+    }
+
+    fun removeGlobalListValues(key: String, values: List<String>) {
+        if (values.isEmpty()) return
+        synchronized(listMutationLock) {
+            val removing = values.toSet()
+            val current = getGlobalList(key).filterNot { it in removing }
+            setGlobalList(key, current)
+        }
+    }
+
+    fun clearGlobalList(key: String) {
+        setGlobalList(key, emptyList())
+    }
+
     /**
      * 修改全局数据（增加或减少数值）
      * @param key 数据键
@@ -423,5 +522,108 @@ class DatabaseManager(val plugin: KaMenu) {
     fun close() {
         dataSource?.close()
         dataSource = null
+    }
+
+    companion object {
+        fun encodeStringList(values: List<String>): String {
+            return values.joinToString(prefix = "[", postfix = "]") { value ->
+                buildString {
+                    append('"')
+                    value.forEach { char ->
+                        when (char) {
+                            '\\' -> append("\\\\")
+                            '"' -> append("\\\"")
+                            '\n' -> append("\\n")
+                            '\r' -> append("\\r")
+                            '\t' -> append("\\t")
+                            else -> append(char)
+                        }
+                    }
+                    append('"')
+                }
+            }
+        }
+
+        fun decodeStringList(raw: String?): List<String> {
+            val text = raw?.trim() ?: return emptyList()
+            if (text.isEmpty()) return emptyList()
+            if (!text.startsWith("[") || !text.endsWith("]")) {
+                return decodeLegacyList(text)
+            }
+
+            val result = mutableListOf<String>()
+            var index = 1
+            fun skipWhitespace() {
+                while (index < text.lastIndex && text[index].isWhitespace()) index++
+            }
+
+            try {
+                while (index < text.lastIndex) {
+                    skipWhitespace()
+                    if (index >= text.lastIndex) break
+
+                    when (text[index]) {
+                        ',' -> {
+                            index++
+                            continue
+                        }
+                        '"' -> {
+                            index++
+                            val value = StringBuilder()
+                            while (index < text.length) {
+                                val char = text[index++]
+                                if (char == '"') break
+                                if (char == '\\' && index < text.length) {
+                                    val escaped = text[index++]
+                                    when (escaped) {
+                                        '"' -> value.append('"')
+                                        '\\' -> value.append('\\')
+                                        '/' -> value.append('/')
+                                        'b' -> value.append('\b')
+                                        'f' -> value.append('\u000C')
+                                        'n' -> value.append('\n')
+                                        'r' -> value.append('\r')
+                                        't' -> value.append('\t')
+                                        'u' -> {
+                                            if (index + 4 <= text.length) {
+                                                val hex = text.substring(index, index + 4)
+                                                value.append(hex.toIntOrNull(16)?.toChar() ?: "\\u$hex")
+                                                index += 4
+                                            } else {
+                                                value.append("\\u")
+                                            }
+                                        }
+                                        else -> value.append(escaped)
+                                    }
+                                } else {
+                                    value.append(char)
+                                }
+                            }
+                            result.add(value.toString())
+                        }
+                        ']' -> break
+                        else -> {
+                            val start = index
+                            while (index < text.lastIndex && text[index] != ',') index++
+                            val token = text.substring(start, index).trim()
+                            if (token.isNotEmpty() && token != "null") {
+                                result.add(token)
+                            }
+                        }
+                    }
+                }
+                return result
+            } catch (_: Exception) {
+                return decodeLegacyList(text)
+            }
+        }
+
+        private fun decodeLegacyList(text: String): List<String> {
+            return when {
+                text.contains('\n') -> text.lines().map { it.trim() }.filter { it.isNotEmpty() }
+                text.contains(',') -> text.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                else -> listOf(text)
+            }
+        }
     }
 }
